@@ -8,7 +8,7 @@ Improvements to make HART even more efficient.
 
 ## Setup on NYU HPC
 
-Login to NYU HPC with your netID and follow the [official instructions](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/greene/software/singularity-with-miniconda) to set up a Singularity container with Miniconda, and use ```cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif``` as the Singularity image.
+Login to NYU HPC with your netID and follow the [official instructions](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/greene/software/singularity-with-miniconda) to set up a Singularity container with Miniconda, and use ```cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif``` as the Singularity image. Be sure to use only a NVIDIA A100 GPU.
 
 Set up Git LFS.
 ```bash
