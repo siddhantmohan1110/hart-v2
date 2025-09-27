@@ -43,9 +43,7 @@ python setup.py install
 
 Note: ShieldGemma-2B from Google DeepMind is used for filtering out unsafe prompts in the demo.
 
-### Gradio demo
-
-You may launch the Gradio demo using the following script:
+Launch the gradio demo.
 
 ```bash
 cd main_dir
