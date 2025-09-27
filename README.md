@@ -8,9 +8,9 @@ Improvements to make HART even more efficient.
 
 ## Setup on NYU HPC
 
-Login to NYU HPC with your netID and follow the [official instructions](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/greene/software/singularity-with-miniconda) to set up a Singularity container with Miniconda, and use ```cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif``` as the Singularity image. Be sure to use only a NVIDIA A100 GPU.
+Login to NYU HPC with your netID and follow the [official instructions](https://sites.google.com/nyu.edu/nyu-hpc/hpc-systems/greene/software/singularity-with-miniconda) to set up a Singularity container with Miniconda, and use ```cuda12.6.3-cudnn9.5.1-ubuntu22.04.5.sif``` as the Singularity image. Use only a NVIDIA A100 GPU.
 
-Set up Git LFS.
+Inside the Singularity container, set up Git LFS.
 ```bash
 conda install -c conda-forge -y git-lfs
 git lfs install
@@ -43,7 +43,7 @@ python setup.py install
 
 Note: ShieldGemma-2B from Google DeepMind is used for filtering out unsafe prompts in the demo.
 
-Launch the gradio demo.
+Launch the Gradio demo.
 
 ```bash
 cd main_dir
