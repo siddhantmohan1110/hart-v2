@@ -47,7 +47,7 @@ Launch the Gradio demo.
 
 ```bash
 cd main_dir
-python ./hart/app.py --model_path ./hart-0.7b-1024px/llm --text_model_path ./Qwen2-VL-1.5B-Instruct --shield_model_path ./shieldgemma-2b
+python ./hart-v2/app.py --model_path ./hart-0.7b-1024px/llm --text_model_path ./Qwen2-VL-1.5B-Instruct --shield_model_path ./shieldgemma-2b
 ```
 
 ## Acknowledgements
