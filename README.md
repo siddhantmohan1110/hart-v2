@@ -35,7 +35,7 @@ Install dependencies.
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 torch==2.6.0+cu126 torchvision==0.21.0+cu126
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 xformers==0.0.29.post2
 
-cd hart
+cd hart-v2
 pip install -e .
 cd hart/kernels
 python setup.py install
