@@ -1,3 +1,18 @@
+import umap
+from typing import List
+from uuid import uuid4
+import numpy as np
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+# import plotly.express as px
+
+
+print("loading topic2vec ....")
+from top2vec import Top2Vec
+# import hdbscan
+import seaborn as sns
+
+
 class Topic2VecClustering:
 
     def __init__(self, **kwargs):
