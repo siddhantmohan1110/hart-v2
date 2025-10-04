@@ -36,6 +36,7 @@ pip install --extra-index-url https://download.pytorch.org/whl/cu126 torch==2.6.
 pip install --extra-index-url https://download.pytorch.org/whl/cu126 xformers==0.0.29.post2
 
 cd hart-v2
+pip install top2vec[sentence_transformers] # for clustering
 pip install -e .
 cd hart/kernels
 python setup.py install

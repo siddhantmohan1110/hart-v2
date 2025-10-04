@@ -21,8 +21,8 @@ dependencies = [
     "einops==0.6.1", "einops-exts==0.0.4", "timm==0.9.12",
     "openpyxl==3.1.2", "datasets==2.16.1", "webdataset==0.2.86",
     "nltk>=3.8.1", "pywsd>=1.2.4", "opencv-python==4.8.0.74",
-    "omegaconf==2.3.0", "diffusers==0.28.2",
-    "einx", "wandb", "xformers==0.0.29.post2",
+    "omegaconf==2.3.0", "diffusers==0.28.2", "seaborn==0.13.2",
+    "einx", "wandb", "xformers==0.0.29.post2", "plotly>=5.18.0,<6.0",
     "spaces==0.30.3", "pre-commit==4.0.1", "black==24.10.0", "isort==5.13.2",
 ]
 
