@@ -23,3 +23,38 @@ User Prompt:\n"""
 
 max_seq_len = 10240
 max_batch_size = 16
+
+great_prompts = [
+    # Group 1 — Landscapes & Nature
+    "A misty mountain valley at sunrise with a river flowing through pine forests.",
+    "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
+    "A tropical beach with turquoise waters and palm trees swaying in the wind.",
+    "A desert landscape with red sand dunes and a caravan of camels at dusk.",
+
+    # # Group 2 — Futuristic & Sci-Fi Cityscapes
+    # "A futuristic city skyline with neon lights and flying cars at night.",
+    # "A cyberpunk street market filled with holographic signs and robots.",
+    # "A floating city above the clouds powered by solar sails and wind turbines.",
+
+    # # Group 3 — Artistic Portraits
+    # "A surreal portrait of a woman with galaxies in her eyes and nebula hair.",
+    # "An oil painting of an old sailor with deep wrinkles and a weathered gaze.",
+    # "A minimalist black-and-white sketch of a young artist painting a mural.",
+
+    # # Group 4 — Fantasy & Mythical Worlds
+    # "A dragon soaring over a medieval castle surrounded by glowing runes.",
+    # "An elven forest village with bioluminescent plants and crystal streams.",
+    # "A battle between a knight and a shadow creature under a blood moon.",
+
+    # # Group 5 — Abstract & Conceptual Art
+    # "A geometric abstraction representing time as flowing ribbons of color.",
+    # "Fractal patterns resembling a blooming flower made of glass shards.",
+    # "An AI-generated dreamscape merging city lights and neural networks.",
+
+    # # Group 6 — Realistic Everyday Scenes
+    # "A rainy street in Tokyo with reflections of neon signs on wet pavement.",
+    # "A farmer’s market in summer with people buying fresh fruits and flowers.",
+    # "A cozy café interior with sunlight streaming through dusty windows.",
+    # "A parked vintage car beside a diner under warm evening light."
+]
+

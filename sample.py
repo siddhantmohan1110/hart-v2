@@ -19,7 +19,13 @@ from transformers import (
 )
 
 from hart.modules.models.transformer import HARTForT2I
-from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
+from hart.utils import (
+    default_prompts,
+    encode_prompts,
+    llm_system_prompt,
+    safety_check,
+    great_prompts
+)
 
 
 def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
@@ -47,6 +53,48 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
         f.write("\n".join(prompts))
 
 
+def _pool_prompt_embeddings(context_tensor, context_mask):
+    mask = context_mask.unsqueeze(-1).to(context_tensor.dtype)
+    token_counts = mask.sum(dim=1).clamp_min(1.0)
+    pooled = (context_tensor * mask).sum(dim=1) / token_counts
+    return pooled
+
+
+def _run_kmeans(embeddings, num_clusters, num_iters=20):
+    if num_clusters <= 0:
+        raise ValueError("num_clusters must be positive.")
+    num_points = embeddings.shape[0]
+    if num_clusters > num_points:
+        raise ValueError("num_clusters cannot exceed the number of embeddings.")
+    centroids = embeddings[torch.randperm(num_points)[:num_clusters]].clone()
+    assignments = torch.zeros(num_points, dtype=torch.long)
+    for _ in range(max(num_iters, 1)):
+        distances = torch.cdist(embeddings, centroids)
+        new_assignments = distances.argmin(dim=1)
+        if torch.equal(assignments, new_assignments):
+            assignments = new_assignments
+            break
+        assignments = new_assignments
+        for idx in range(num_clusters):
+            mask = assignments == idx
+            if mask.any():
+                centroids[idx] = embeddings[mask].mean(dim=0)
+            else:
+                replacement_idx = torch.randint(0, num_points, ()).item()
+                centroids[idx] = embeddings[replacement_idx]
+    else:
+        distances = torch.cdist(embeddings, centroids)
+        assignments = distances.argmin(dim=1)
+    return assignments, centroids
+
+
+
+def _batched_indices(length: int, batch_size: int):
+    if batch_size <= 0:
+        raise ValueError("Batch size must be positive.")
+    for start in range(0, length, batch_size):
+        yield start, min(start + batch_size, length)
+
 def main(args):
     device = torch.device("cuda")
 
@@ -72,26 +120,27 @@ def main(args):
         torch_dtype=torch.bfloat16,
     ).to(device)
 
-    prompts = []
+    prompts: list[str] = []
     if args.prompt:
         prompts = [args.prompt]
     elif args.prompt_list:
-        prompts = args.prompts
+        prompts = great_prompts
     else:
         print(
             "No prompt is provided. Will randomly sample 4 prompts from default prompts."
         )
         prompts = random.sample(default_prompts, 4)
 
-    for idx, prompt in enumerate(prompts):
-        if safety_check.is_dangerous(
-            safety_checker_tokenizer, safety_checker_model, prompt
-        ):
-            prompts[idx] = random.sample(default_prompts, 1)[0]
-            print(
-                f"Detected Unsafe prompt with index {idx}, will replace by one of default prompts."
-            )
+    # for idx, prompt in enumerate(prompts):
+    #     if safety_check.is_dangerous(
+    #         safety_checker_tokenizer, safety_checker_model, prompt
+    #     ):
+    #         prompts[idx] = random.sample(default_prompts, 1)[0]
+    #         print(
+    #             f"Detected Unsafe prompt with index {idx}, will replace by one of default prompts."
+    #         )
 
+    inference_time = 0.0
     start_time = time.time()
     with torch.inference_mode():
         with torch.autocast(
@@ -99,7 +148,7 @@ def main(args):
         ):
 
             (
-                context_tokens,
+                _,
                 context_mask,
                 context_position_ids,
                 context_tensor,
@@ -112,23 +161,89 @@ def main(args):
                 args.use_llm_system_prompt,
             )
 
+            context_tensor_all = context_tensor.float().cpu()
+            context_mask_all = context_mask.cpu()
+            context_position_ids_all = context_position_ids.cpu()
+
+            del context_tensor, context_mask, context_position_ids
+            cluster_assignments = None
+            cluster_context_tensor = None
+            cluster_count = 0
+            if (
+                args.num_clusters
+                and args.num_clusters > 0
+                and len(prompts) >= args.num_clusters
+            ):
+                cluster_count = min(args.num_clusters, len(prompts))
+                pooled_embeddings = _pool_prompt_embeddings(
+                    context_tensor_all, context_mask_all
+                ).float()
+                assignments, _ = _run_kmeans(
+                    pooled_embeddings.detach(),
+                    cluster_count,
+                    args.kmeans_iters,
+                )
+                cluster_contexts = []
+                for cluster_idx in range(cluster_count):
+                    mask = assignments == cluster_idx
+                    if mask.any():
+                        cluster_contexts.append(context_tensor_all[mask].mean(dim=0))
+                    else:
+                        cluster_contexts.append(context_tensor_all.mean(dim=0))
+                cluster_context_tensor = torch.stack(cluster_contexts, dim=0)
+                cluster_assignments = assignments
+
+                assignment_list = assignments.tolist()
+                for cluster_idx in range(cluster_count):
+                    member_prompts = [
+                        prompts[p_idx]
+                        for p_idx, cluster_id in enumerate(assignment_list)
+                        if cluster_id == cluster_idx
+                    ]
+                    print(
+                        f"Cluster {cluster_idx}: {len(member_prompts)} prompts"
+                    )
+
             infer_func = (
                 ema_model.autoregressive_infer_cfg
                 if args.use_ema
                 else model.autoregressive_infer_cfg
             )
-            output_imgs = infer_func(
-                B=context_tensor.size(0),
-                label_B=context_tensor,
-                cfg=args.cfg,
-                g_seed=args.seed,
-                more_smooth=args.more_smooth,
-                context_position_ids=context_position_ids,
-                context_mask=context_mask,
-            )
+            outputs = []
+            for start, end in _batched_indices(
+                len(prompts), args.prompts_per_batch
+            ):
+                context_tensor_chunk = context_tensor_all[start:end].to(device)
+                context_mask_chunk = context_mask_all[start:end].to(device)
+                context_position_ids_chunk = context_position_ids_all[start:end].to(
+                    device
+                )
+                if cluster_assignments is not None:
+                    cluster_assignments_chunk = cluster_assignments[start:end]
+                else:
+                    cluster_assignments_chunk = None
+                chunk_start = time.time()
+                output_chunk = infer_func(
+                    B=context_tensor_chunk.size(0),
+                    label_B=context_tensor_chunk,
+                    cluster_assignments=cluster_assignments_chunk,
+                    cluster_context_tensor=cluster_context_tensor,
+                    cluster_warmup_steps=args.cluster_warmup_steps,
+                    cfg=args.cfg,
+                    g_seed=args.seed,
+                    more_smooth=args.more_smooth,
+                    context_position_ids=context_position_ids_chunk,
+                    context_mask=context_mask_chunk,
+                )
+                inference_time += time.time() - chunk_start
+                outputs.append(output_chunk.detach().cpu())
+            output_imgs = torch.cat(outputs, dim=0)
 
     total_time = time.time() - start_time
-    print(f"Generate {len(prompts)} images take {total_time:2f}s.")
+    print(
+        f"Generate {len(prompts)} images in {total_time:2f}s "
+        f"(batched inference {inference_time:2f}s)."
+    )
 
     save_images(
         output_imgs.clone(), args.sample_folder_dir, args.store_seperately, prompts
@@ -141,7 +256,7 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="pretrained_models/HART-1024",
+        default="hart-0.7b-1024px/llm",
     )
     parser.add_argument(
         "--text_model_path",
@@ -153,14 +268,44 @@ if __name__ == "__main__":
         "--shield_model_path",
         type=str,
         help="The path to shield model, we employ ShieldGemma-2B by default.",
-        default="pretrained_models/shieldgemma-2b",
+        default="shieldgemma-2b",
     )
     parser.add_argument("--prompt", type=str, help="A single prompt.", default="")
-    parser.add_argument("--prompt_list", type=list[str], default=[])
+    parser.add_argument(
+        "--prompt_list",
+        nargs="+",
+        type=str,
+        help="Space separated list of prompts.",
+        default=None,
+    )
+    parser.add_argument(
+        "--num_clusters",
+        type=int,
+        default=4,
+        help="Number of clusters to form over prompt embeddings.",
+    )
+    parser.add_argument(
+        "--cluster_warmup_steps",
+        type=int,
+        default=5,
+        help="Number of low-resolution stages to guide via cluster centers.",
+    )
+    parser.add_argument(
+        "--kmeans_iters",
+        type=int,
+        default=20,
+        help="Number of k-means refinement iterations.",
+    )
+    parser.add_argument(
+        "--prompts_per_batch",
+        type=int,
+        default=8,
+        help="Number of prompts to process per model forward pass.",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--use_ema", type=bool, default=True)
     parser.add_argument("--max_token_length", type=int, default=300)
-    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
+    parser.add_argument("--use_llm_system_prompt", type=bool, default=False)
     parser.add_argument(
         "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
     )

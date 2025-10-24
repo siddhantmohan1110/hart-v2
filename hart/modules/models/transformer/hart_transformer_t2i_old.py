@@ -312,9 +312,6 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
-        cluster_assignments: Optional[torch.LongTensor] = None,
-        cluster_context_tensor: Optional[torch.Tensor] = None,
-        cluster_warmup_steps: int = 0,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -342,31 +339,6 @@ class HARTForT2I(PreTrainedModel):
                 torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
             )
         )
-        cluster_enabled = (
-            cluster_assignments is not None
-            and cluster_context_tensor is not None
-            and cluster_warmup_steps > 0
-        )
-        if cluster_enabled:
-            cluster_assignments = cluster_assignments.to(
-                label_B.device, dtype=torch.long
-            )
-            cluster_assignments = cluster_assignments.view(B)
-            cluster_context_tensor = cluster_context_tensor.to(
-                label_B.device, dtype=label_B.dtype
-            )
-            cluster_warmup_steps = min(
-                cluster_warmup_steps, max(len(self.patch_nums) - 1, 0)
-            )
-            cluster_cond = self.context_embed(
-                self.context_norm(cluster_context_tensor)
-            ).to(cond_BD.dtype)
-            cluster_sos = cluster_cond[:, : self.first_l, :]
-        else:
-            cluster_warmup_steps = 0
-            cluster_cond = None
-            cluster_sos = None
-
         # Haotian: need to handle CFG here so we replicate context position ids
         context_position_ids = torch.cat(
             (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
@@ -402,22 +374,14 @@ class HARTForT2I(PreTrainedModel):
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
+            # last_L = cur_L
             if si > 0:
                 cur_L += pn * pn
             else:
                 cur_L += self.context_token
-            use_cluster_stage = cluster_enabled and si < cluster_warmup_steps
-            if use_cluster_stage:
-                stage_cond_BD = cond_BD.clone()
-                stage_cond_BD[:B, : self.first_l, :] = cluster_sos[cluster_assignments]
-            else:
-                stage_cond_BD = cond_BD
-            cond_BD_or_gss = self.shared_ada_lin(stage_cond_BD)
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            if use_cluster_stage:
-                x = x.clone()
-                slice_len = min(self.first_l, x.shape[1])
-                x[:B, :slice_len, :] = cluster_sos[cluster_assignments, :slice_len, :]
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 # Haotian: si used for position embed
@@ -429,7 +393,7 @@ class HARTForT2I(PreTrainedModel):
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                 )
-            logits_BlV = self.get_logits(x, stage_cond_BD)
+            logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
 
@@ -470,8 +434,6 @@ class HARTForT2I(PreTrainedModel):
             next_token_map = next_token_map.repeat(
                 2, 1, 1
             )  # double the batch sizes due to CFG
-
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
