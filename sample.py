@@ -53,12 +53,17 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
         f.write("\n".join(prompts))
 
 
-def _pool_prompt_embeddings(context_tensor, context_mask):
+def _pool_prompt_embeddings(context_tensor, context_mask, truncate_tokens=None):
     del context_mask  # context mask is not needed for truncated embedding clustering
-    if context_tensor.size(1) < 20:
-        raise ValueError("context_tensor must have at least 20 tokens to truncate.")
-    truncated = context_tensor[:, :20, :]
-    return truncated.reshape(truncated.size(0), -1)
+    if truncate_tokens is not None:
+        if truncate_tokens <= 0:
+            raise ValueError("truncate_tokens must be positive when provided.")
+        if context_tensor.size(1) < truncate_tokens:
+            raise ValueError(
+                f"context_tensor must have at least {truncate_tokens} tokens to truncate."
+            )
+        context_tensor = context_tensor[:, :truncate_tokens, :]
+    return context_tensor.reshape(context_tensor.size(0), -1)
 
 
 def _run_kmeans(embeddings, num_clusters, num_iters=20):
@@ -87,6 +92,43 @@ def _run_kmeans(embeddings, num_clusters, num_iters=20):
         distances = torch.cdist(embeddings, centroids)
         assignments = distances.argmin(dim=1)
     return assignments, centroids
+
+
+def _run_hdbscan(embeddings, min_cluster_size=5, min_samples=None):
+    try:
+        import hdbscan
+    except ImportError as exc:
+        raise ImportError(
+            "HDBSCAN clustering requires the `hdbscan` package. "
+            "Install it with `pip install hdbscan`."
+        ) from exc
+
+    embeddings_np = embeddings.detach().cpu().numpy()
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size, min_samples=min_samples
+    )
+    clusterer.fit(embeddings_np)
+    labels = clusterer.labels_
+    if labels.size == 0:
+        raise ValueError("HDBSCAN did not return any cluster labels.")
+
+    assignments = torch.empty(len(labels), dtype=torch.long)
+    label_mapping = {}
+    next_cluster_id = 0
+    for idx, label in enumerate(labels):
+        if label >= 0:
+            if label not in label_mapping:
+                label_mapping[label] = next_cluster_id
+                next_cluster_id += 1
+            assignments[idx] = label_mapping[label]
+        else:
+            assignments[idx] = next_cluster_id
+            next_cluster_id += 1
+
+    if next_cluster_id == 0:
+        raise ValueError("HDBSCAN did not identify any clusters.")
+
+    return assignments, next_cluster_id
 
 
 
@@ -168,41 +210,65 @@ def main(args):
             del context_tensor, context_mask, context_position_ids
             cluster_assignments = None
             cluster_context_tensor = None
-            cluster_count = 0
-            if (
-                args.num_clusters
-                and args.num_clusters > 0
-                and len(prompts) >= args.num_clusters
-            ):
-                cluster_count = min(args.num_clusters, len(prompts))
-                pooled_embeddings = _pool_prompt_embeddings(
-                    context_tensor_all, context_mask_all
-                ).float()
-                assignments, _ = _run_kmeans(
-                    pooled_embeddings.detach(),
-                    cluster_count,
-                    args.kmeans_iters,
-                )
+            cluster_method = args.cluster_method.lower()
+            if cluster_method == "kmeans":
+                if (
+                    args.num_clusters
+                    and args.num_clusters > 0
+                    and len(prompts) >= args.num_clusters
+                ):
+                    pooled_embeddings = _pool_prompt_embeddings(
+                        context_tensor_all,
+                        context_mask_all,
+                        truncate_tokens=args.cluster_truncate_tokens,
+                    ).float()
+                    assignments, _ = _run_kmeans(
+                        pooled_embeddings.detach(),
+                        min(args.num_clusters, len(prompts)),
+                        args.kmeans_iters,
+                    )
+                    cluster_assignments = assignments
+                else:
+                    print(
+                        "Skipping k-means clustering: ensure num_clusters "
+                        "is positive and does not exceed the number of prompts."
+                    )
+            elif cluster_method == "hdbscan":
+                if len(prompts) > 0:
+                    pooled_embeddings = _pool_prompt_embeddings(
+                        context_tensor_all,
+                        context_mask_all,
+                        truncate_tokens=args.cluster_truncate_tokens,
+                    ).float()
+                    assignments, _ = _run_hdbscan(
+                        pooled_embeddings.detach(),
+                        min_cluster_size=args.hdbscan_min_cluster_size,
+                        min_samples=args.hdbscan_min_samples,
+                    )
+                    cluster_assignments = assignments
+                else:
+                    print("Skipping HDBSCAN clustering: no prompts available.")
+
+            if cluster_assignments is not None:
+                cluster_assignments = cluster_assignments.to(dtype=torch.long)
+                cluster_count = int(cluster_assignments.max().item()) + 1
                 cluster_contexts = []
                 for cluster_idx in range(cluster_count):
-                    mask = assignments == cluster_idx
+                    mask = cluster_assignments == cluster_idx
                     if mask.any():
                         cluster_contexts.append(context_tensor_all[mask].mean(dim=0))
                     else:
                         cluster_contexts.append(context_tensor_all.mean(dim=0))
                 cluster_context_tensor = torch.stack(cluster_contexts, dim=0)
-                cluster_assignments = assignments
 
-                assignment_list = assignments.tolist()
+                assignment_list = cluster_assignments.tolist()
                 for cluster_idx in range(cluster_count):
                     member_prompts = [
                         prompts[p_idx]
                         for p_idx, cluster_id in enumerate(assignment_list)
                         if cluster_id == cluster_idx
                     ]
-                    print(
-                        f"Cluster {cluster_idx}: {len(member_prompts)} prompts"
-                    )
+                    print(f"Cluster {cluster_idx}: {len(member_prompts)} prompts")
 
             infer_func = (
                 ema_model.autoregressive_infer_cfg
@@ -290,6 +356,13 @@ if __name__ == "__main__":
         help="Number of clusters to form over prompt embeddings.",
     )
     parser.add_argument(
+        "--cluster_method",
+        type=str,
+        choices=["none", "kmeans", "hdbscan"],
+        default="kmeans",
+        help="Clustering method to apply to prompt embeddings.",
+    )
+    parser.add_argument(
         "--cluster_warmup_steps",
         type=int,
         default=5,
@@ -300,6 +373,24 @@ if __name__ == "__main__":
         type=int,
         default=20,
         help="Number of k-means refinement iterations.",
+    )
+    parser.add_argument(
+        "--hdbscan_min_cluster_size",
+        type=int,
+        default=5,
+        help="Minimum cluster size when using HDBSCAN.",
+    )
+    parser.add_argument(
+        "--hdbscan_min_samples",
+        type=int,
+        default=None,
+        help="Minimum samples parameter for HDBSCAN (defaults to min_cluster_size).",
+    )
+    parser.add_argument(
+        "--cluster_truncate_tokens",
+        type=int,
+        default=None,
+        help="Truncate context embeddings to this many tokens before clustering.",
     )
     parser.add_argument(
         "--prompts_per_batch",

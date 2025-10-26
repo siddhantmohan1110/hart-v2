@@ -416,11 +416,15 @@ class HARTForT2I(PreTrainedModel):
                 torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
             )
         )
+
+        
+        
         cluster_enabled = (
             cluster_assignments is not None
             and cluster_context_tensor is not None
             and cluster_warmup_steps > 0
         )
+
         if cluster_enabled:
             cluster_assignments = cluster_assignments.to(
                 label_B.device, dtype=torch.long
@@ -436,6 +440,8 @@ class HARTForT2I(PreTrainedModel):
                 self.context_norm(cluster_context_tensor)
             ).to(cond_BD.dtype)
             cluster_sos = cluster_cond[:, : self.first_l, :]
+            cond_BD[B:, : self.first_l, :] = cluster_sos[cluster_assignments]
+            sos = cond_BD
         else:
             cluster_warmup_steps = 0
             cluster_cond = None
@@ -458,16 +464,20 @@ class HARTForT2I(PreTrainedModel):
         else:
             lvl_pos = self.lvl_embed(self.lvl_1L)
 
+        if cluster_enabled:
+            base_context = cluster_sos[cluster_assignments]
+            base_context = torch.cat((base_context, cluster_sos[cluster_assignments]), dim=0)
+        else:
+            base_context = sos
+
         if self.pos_start is not None:
             next_token_map = (
-                sos.expand(2 * B, self.first_l, -1)
-                + self.pos_start.expand(2 * B, self.first_l, -1)
+                base_context
+                + self.pos_start.expand_as(base_context)
                 + lvl_pos[:, : self.first_l]
             )
         else:
-            next_token_map = (
-                sos.expand(2 * B, self.first_l, -1) + lvl_pos[:, : self.first_l]
-            )
+            next_token_map = base_context + lvl_pos[:, : self.first_l]
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
@@ -491,7 +501,7 @@ class HARTForT2I(PreTrainedModel):
             if use_cluster_stage:
                 x = x.clone()
                 slice_len = min(self.first_l, x.shape[1])
-                x[:B, :slice_len, :] = cluster_sos[cluster_assignments, :slice_len, :]
+                #x[:B, :slice_len, :] = cluster_sos[cluster_assignments, :slice_len, :]
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 # Haotian: si used for position embed
