@@ -24,7 +24,7 @@ User Prompt:\n"""
 max_seq_len = 10240
 max_batch_size = 16
 
-great_prompts = [
+artificial_prompts = [
     # Group 1 — Landscapes & Nature
     "A misty mountain valley at sunrise with a river flowing through pine forests.",
     "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
@@ -57,4 +57,3 @@ great_prompts = [
     # "A cozy café interior with sunlight streaming through dusty windows.",
     # "A parked vintage car beside a diner under warm evening light."
 ]
-

@@ -24,7 +24,7 @@ from hart.utils import (
     encode_prompts,
     llm_system_prompt,
     safety_check,
-    great_prompts
+    artificial_prompts
 )
 
 
@@ -54,10 +54,11 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
 
 
 def _pool_prompt_embeddings(context_tensor, context_mask):
-    mask = context_mask.unsqueeze(-1).to(context_tensor.dtype)
-    token_counts = mask.sum(dim=1).clamp_min(1.0)
-    pooled = (context_tensor * mask).sum(dim=1) / token_counts
-    return pooled
+    del context_mask  # context mask is not needed for truncated embedding clustering
+    if context_tensor.size(1) < 20:
+        raise ValueError("context_tensor must have at least 20 tokens to truncate.")
+    truncated = context_tensor[:, :20, :]
+    return truncated.reshape(truncated.size(0), -1)
 
 
 def _run_kmeans(embeddings, num_clusters, num_iters=20):
@@ -113,18 +114,17 @@ def main(args):
     text_model.eval()
     text_tokenizer_max_length = args.max_token_length
 
-    safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
-    safety_checker_model = AutoModelForCausalLM.from_pretrained(
-        args.shield_model_path,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    ).to(device)
+    # safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
+    # safety_checker_model = AutoModelForCausalLM.from_pretrained(
+    #     args.shield_model_path,
+    #     device_map="auto",
+    #     torch_dtype=torch.bfloat16,
+    # ).to(device)
 
     prompts: list[str] = []
-    if args.prompt:
-        prompts = [args.prompt]
-    elif args.prompt_list:
-        prompts = great_prompts
+    
+    if args.use_artificial_prompts:
+        prompts = artificial_prompts
     else:
         print(
             "No prompt is provided. Will randomly sample 4 prompts from default prompts."
@@ -272,11 +272,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--prompt", type=str, help="A single prompt.", default="")
     parser.add_argument(
-        "--prompt_list",
-        nargs="+",
-        type=str,
-        help="Space separated list of prompts.",
-        default=None,
+        "--use_artificial_prompts",
+        type=bool,
+        help="Use artificial prompts",
+        default=True,
     )
     parser.add_argument(
         "--num_clusters",
