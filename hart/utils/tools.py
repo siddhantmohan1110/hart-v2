@@ -57,7 +57,7 @@ def encode_prompts(
     if not use_llm_system_prompt:
         context_tensor = text_model(
             context_tokens, attention_mask=context_mask, output_hidden_states=True
-        ).hidden_states[-1]
+        ).hidden_states[-1] # [300 * 1528] Dimension QWen output
     else:
         system_prompt_tokens = tokenize_fn(
             [system_prompt],

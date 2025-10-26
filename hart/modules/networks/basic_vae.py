@@ -141,10 +141,10 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         self.ch = ch
-        self.num_resolutions = len(ch_mult)
+        self.num_resolutions = len(ch_mult) # The number of scales.
         self.downsample_ratio = 2 ** (self.num_resolutions - 1)
-        self.num_res_blocks = num_res_blocks
-        self.in_channels = in_channels
+        self.num_res_blocks = num_res_blocks # 2 residual blocks
+        self.in_channels = in_channels # 3 in channels.
 
         # downsampling
         self.conv_in = torch.nn.Conv2d(
@@ -152,11 +152,11 @@ class Encoder(nn.Module):
         )
 
         in_ch_mult = (1,) + tuple(ch_mult)
-        self.down = nn.ModuleList()
-        for i_level in range(self.num_resolutions):
+        self.down = nn.ModuleList() # Downsampling modules.
+        for i_level in range(self.num_resolutions): # For each scale.
             block = nn.ModuleList()
             attn = nn.ModuleList()
-            block_in = ch * in_ch_mult[i_level]
+            block_in = ch * in_ch_mult[i_level] # Each block-in take the in channel and out channel becomes the input to the next channel.
             block_out = ch * ch_mult[i_level]
             for i_block in range(self.num_res_blocks):
                 block.append(

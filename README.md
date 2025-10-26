@@ -51,6 +51,20 @@ cd main_dir
 python ./hart-v2/app.py --model_path ./hart-0.7b-1024px/llm --text_model_path ./Qwen2-VL-1.5B-Instruct --shield_model_path ./shieldgemma-2b
 ```
 
+
+**Install BertTopic for clustering**
+
+```
+pip install bertopic
+
+
+# Install cuML for UMAP and HDBSCAN GPU implementation.
+pip install cudf-cu12 dask-cudf-cu12 --extra-index-url=https://pypi.nvidia.com
+pip install cuml-cu12 --extra-index-url=https://pypi.nvidia.com
+pip install cugraph-cu12 --extra-index-url=https://pypi.nvidia.com
+pip install --upgrade cupy-cuda12x -f https://pip.cupy.dev/aarch64
+```
+
 ## Acknowledgements
 
 Our codebase is inspired by amazing open source research projects such as [HART](https://github.com/mit-han-lab/hart) and [VAR](https://github.com/FoundationVision/VAR).
