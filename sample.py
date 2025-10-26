@@ -64,7 +64,7 @@ def _pool_prompt_embeddings(context_tensor, context_mask):
 def _run_kmeans(embeddings, num_clusters, num_iters=20):
     if num_clusters <= 0:
         raise ValueError("num_clusters must be positive.")
-    num_points = embeddings.shape[0]
+    num_points = embeddings.shape[0] #batch_size
     if num_clusters > num_points:
         raise ValueError("num_clusters cannot exceed the number of embeddings.")
     centroids = embeddings[torch.randperm(num_points)[:num_clusters]].clone()
@@ -148,10 +148,10 @@ def main(args):
         ):
 
             (
-                _,
-                context_mask,
-                context_position_ids,
-                context_tensor,
+                _, #context_tokens
+                context_mask, # marking every osition that isn't the tokenizer's pad token
+                context_position_ids, #  produces 1, 2, 3 wherever the mask is true and holds the previous value where it’s false
+                context_tensor, #output of last hidden state
             ) = encode_prompts(
                 prompts,
                 text_model,
@@ -234,10 +234,16 @@ def main(args):
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids_chunk,
                     context_mask=context_mask_chunk,
+                    save_autoregressive_steps=args.save_autoregressive_steps,
+                    sample_folder_dir=args.sample_folder_dir,
+                    store_seperately=args.store_seperately,
+                    prompts=prompts[start:end],
+                    prompt_offset=start,
                 )
                 inference_time += time.time() - chunk_start
                 outputs.append(output_chunk.detach().cpu())
             output_imgs = torch.cat(outputs, dim=0)
+            
 
     total_time = time.time() - start_time
     print(
@@ -323,6 +329,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--store_seperately",
         help="Store image samples in a grid or separately, set to False by default.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--save_autoregressive_steps",
+        help="Enable saving intermediate autoregressive stage images.",
         action="store_true",
     )
     args = parser.parse_args()

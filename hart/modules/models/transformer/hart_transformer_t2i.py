@@ -6,12 +6,14 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 import math
 import os
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
+import torchvision
+from PIL import Image
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
@@ -33,6 +35,49 @@ from hart.modules.networks.utils import (
     sample_with_top_k_top_p_,
 )
 from hart.utils import get_device
+
+
+def save_images(
+    sample_imgs: torch.Tensor,
+    sample_folder_dir: str,
+    store_seperately: bool,
+    prompts: Sequence[str],
+) -> None:
+    """Persist a batch of images (float tensor in [0, 1]) to disk."""
+    if sample_imgs.ndim != 4:
+        raise ValueError("sample_imgs must be a 4D tensor (N, C, H, W).")
+
+    os.makedirs(sample_folder_dir, exist_ok=True)
+    sample_imgs = sample_imgs.detach().cpu()
+
+    if not store_seperately and sample_imgs.shape[0] > 1:
+        grid = torchvision.utils.make_grid(
+            sample_imgs, nrow=min(12, sample_imgs.shape[0])
+        )
+        grid_np = (
+            grid.mul(255.0)
+            .clamp_(0.0, 255.0)
+            .permute(1, 2, 0)
+            .to(torch.uint8)
+            .numpy()
+        )
+        Image.fromarray(grid_np).save(os.path.join(sample_folder_dir, "sample_images.png"))
+    else:
+        imgs_uint8 = (
+            sample_imgs.mul(255.0)
+            .clamp_(0.0, 255.0)
+            .permute(0, 2, 3, 1)
+            .to(torch.uint8)
+            .numpy()
+        )
+        for img_idx, cur_img in enumerate(imgs_uint8):
+            Image.fromarray(cur_img).save(
+                os.path.join(sample_folder_dir, f"{img_idx:06d}.png")
+            )
+
+    if prompts:
+        with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
+            f.write("\n".join(prompts))
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
@@ -315,6 +360,11 @@ class HARTForT2I(PreTrainedModel):
         cluster_assignments: Optional[torch.LongTensor] = None,
         cluster_context_tensor: Optional[torch.Tensor] = None,
         cluster_warmup_steps: int = 0,
+        save_autoregressive_steps: bool = False,
+        sample_folder_dir: Optional[str] = None,
+        store_seperately: bool = False,
+        prompts: Optional[Sequence[str]] = None,
+        prompt_offset: int = 0,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -336,6 +386,30 @@ class HARTForT2I(PreTrainedModel):
             rng = self.rng
         assert label_B is not None
         assert label_B.shape[1] == self.context_token
+
+        record_intermediate = (
+            save_autoregressive_steps and sample_folder_dir is not None
+        )
+        intermediate_dir: Optional[str] = None
+        base_prompts = list(prompts) if prompts is not None else []
+        stage_images_per_prompt: List[List[torch.Tensor]] = []
+        if record_intermediate:
+            intermediate_dir = os.path.join(
+                sample_folder_dir, "autoregressive_steps"
+            )
+            os.makedirs(intermediate_dir, exist_ok=True)
+            stage_images_per_prompt = [[] for _ in range(B)]
+
+        stage_counter = 0
+
+        def record_stage_output(label: str) -> None:
+            if not record_intermediate:
+                return
+            stage_imgs = self.vae_proxy[0].fhat_to_img(f_hat)
+            stage_imgs = stage_imgs.add(1).mul(0.5)
+            stage_imgs = stage_imgs.clamp_(0.0, 1.0).detach().cpu()
+            for prompt_idx, img in enumerate(stage_imgs):
+                stage_images_per_prompt[prompt_idx].append(img)
 
         sos = cond_BD = self.context_embed(
             self.context_norm(
@@ -461,6 +535,8 @@ class HARTForT2I(PreTrainedModel):
             ].get_next_autoregressive_input(
                 si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
             )
+            record_stage_output(f"stage_{si:02d}")
+            stage_counter += 1
 
             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
             next_token_map = (
@@ -560,14 +636,47 @@ class HARTForT2I(PreTrainedModel):
             B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]
         )
         f_hat += h_BChw_final
+        record_stage_output(f"stage_{len(self.patch_nums) - 1:02d}_final")
 
         ################ last stage maskgit ################
 
+        final_imgs = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+
+        if record_intermediate:
+            assert intermediate_dir is not None
+            grid_cols = 4
+            grid_cells = grid_cols * grid_cols
+            for prompt_idx, images in enumerate(stage_images_per_prompt):
+                if not images:
+                    continue
+                stack = torch.stack(images, dim=0)
+                if stack.shape[0] < grid_cells:
+                    pad = stack[-1:].repeat(grid_cells - stack.shape[0], 1, 1, 1)
+                    stack = torch.cat([stack, pad], dim=0)
+                elif stack.shape[0] > grid_cells:
+                    stack = stack[:grid_cells]
+                grid = torchvision.utils.make_grid(stack, nrow=grid_cols)
+                grid_np = (
+                    grid.mul(255.0)
+                    .clamp_(0.0, 255.0)
+                    .permute(1, 2, 0)
+                    .to(torch.uint8)
+                    .numpy()
+                )
+                global_idx = prompt_offset + prompt_idx
+                Image.fromarray(grid_np).save(
+                    os.path.join(intermediate_dir, f"{global_idx:04d}_stages.png")
+                )
+            if base_prompts:
+                prompts_path = os.path.join(intermediate_dir, "prompts.txt")
+                with open(prompts_path, "a") as f:
+                    for prompt_idx, prompt in enumerate(base_prompts):
+                        global_idx = prompt_offset + prompt_idx
+                        f.write(f"{global_idx:04d}: {prompt}\n")
+
         for b in self.blocks:
             b.attn.kv_caching(False)
-        return (
-            self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
-        )  # de-normalize, from [-1, 1] to [0, 1]
+        return final_imgs  # de-normalize, from [-1, 1] to [0, 1]
 
     def sample_orders(self, bsz):
         # generate a batch of random generation orders
