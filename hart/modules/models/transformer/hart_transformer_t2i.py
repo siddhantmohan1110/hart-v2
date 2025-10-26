@@ -312,6 +312,8 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
+        cluster_centroid_context: Optional[torch.Tensor] = None,
+        use_cluster_levels: int = 4,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -322,6 +324,8 @@ class HARTForT2I(PreTrainedModel):
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :param cluster_centroid_context: Context tensor from cluster centroid for first N levels
+        :param use_cluster_levels: Number of pyramid levels to use cluster centroid (default: 4)
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
         # num_maskgit_iters = 1
@@ -334,11 +338,28 @@ class HARTForT2I(PreTrainedModel):
         assert label_B is not None
         assert label_B.shape[1] == self.context_token
 
-        sos = cond_BD = self.context_embed(
+        # Store original context for later use
+        original_label_B = label_B
+
+        # Create original context (with CFG doubling)
+        original_sos = self.context_embed(
             self.context_norm(
                 torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
             )
         )
+
+        # Create cluster centroid context if provided
+        if cluster_centroid_context is not None and use_cluster_levels > 0:
+            cluster_centroid_sos = self.context_embed(
+                self.context_norm(
+                    torch.cat((cluster_centroid_context, torch.full_like(cluster_centroid_context, fill_value=0.0)), dim=0)
+                )
+            )
+        else:
+            cluster_centroid_sos = None
+        
+        # Start with cluster centroid if available, otherwise use original
+        sos = cond_BD = cluster_centroid_sos if cluster_centroid_sos is not None else original_sos
         # Haotian: need to handle CFG here so we replicate context position ids
         context_position_ids = torch.cat(
             (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
@@ -374,6 +395,18 @@ class HARTForT2I(PreTrainedModel):
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
+            
+            # ========== CLUSTER-BASED CONTEXT SWITCHING ==========
+            # Use cluster centroid for first use_cluster_levels levels
+            # Then switch to original prompt context from 5th level onwards
+            if si < use_cluster_levels and cluster_centroid_sos is not None:
+                # Use cluster centroid context for early levels
+                cond_BD = cluster_centroid_sos
+            else:
+                # Switch to original context for later levels
+                cond_BD = original_sos
+            # =====================================================
+            
             # last_L = cur_L
             if si > 0:
                 cur_L += pn * pn
