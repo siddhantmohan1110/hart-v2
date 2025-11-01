@@ -12,6 +12,7 @@ import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 from PIL import Image
 from huggingface_hub import PyTorchModelHubMixin
@@ -360,6 +361,8 @@ class HARTForT2I(PreTrainedModel):
         cluster_assignments: Optional[torch.LongTensor] = None,
         cluster_context_tensor: Optional[torch.Tensor] = None,
         cluster_warmup_steps: int = 0,
+        cluster_centroid_patches: Optional[List[torch.Tensor]] = None,
+        cluster_stage_N: Optional[int] = None,
         save_autoregressive_steps: bool = False,
         sample_folder_dir: Optional[str] = None,
         store_seperately: bool = False,
@@ -368,14 +371,25 @@ class HARTForT2I(PreTrainedModel):
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
+        
+        This function can optionally use pre-computed cluster centroid patches to skip the early
+        stages of generation. When cluster_centroid_patches and cluster_stage_N are provided:
+        - Stages 0 through N are skipped
+        - Generation starts from stage N+1 using the provided accumulated f_hat feature map
+        - The next_token_map is computed from the last provided patch
+        
         :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
-        :param g_seed: random seed
+        :param label_B: context conditioning tensor (e.g., text embeddings)
+        :param g_seed: random seed for reproducibility
         :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling
-        :param top_p: top-p sampling
-        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
-        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
+        :param top_k: top-k sampling threshold
+        :param top_p: top-p (nucleus) sampling threshold
+        :param more_smooth: use gumbel softmax for smoother sampling (not used in benchmarking)
+        :param cluster_centroid_patches: List of feature maps (B, Cvae, H, W) representing accumulated 
+            f_hat at each stage up to N. The last element should be the complete f_hat at stage N.
+        :param cluster_stage_N: Stage number (0-indexed) to start generation from. Stages 0 to N 
+            are skipped and replaced by the provided patches. Must satisfy: 0 <= cluster_stage_N < len(patch_nums)-1
+        :return: Generated images as tensor (B, 3, H, W) in range [0, 1]
         """
         # num_maskgit_iters = 1
         # final_stage = 2
@@ -481,15 +495,63 @@ class HARTForT2I(PreTrainedModel):
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-
+        
+        # Check if we should use pre-computed cluster centroid patches
+        start_stage = 0
+        if cluster_centroid_patches is not None and cluster_stage_N is not None:
+            if cluster_stage_N < 0 or cluster_stage_N >= len(self.patch_nums) - 1:
+                raise ValueError(f"cluster_stage_N must be between 0 and {len(self.patch_nums) - 2}, got {cluster_stage_N}")
+            
+            # cluster_centroid_patches should be the accumulated f_hat at each stage
+            # The last patch is the complete f_hat at stage cluster_stage_N
+            if len(cluster_centroid_patches) > 0:
+                # Use the last patch as the accumulated f_hat
+                f_hat = cluster_centroid_patches[-1]
+                
+                # Calculate cur_L for the stages we're skipping
+                for si in range(cluster_stage_N + 1):
+                    if si == 0:
+                        cur_L += self.context_token
+                    else:
+                        cur_L += self.patch_nums[si] * self.patch_nums[si]
+                
+                # Get the next token map from f_hat
+                if cluster_stage_N < len(self.patch_nums) - 2:
+                    # Downsample to next stage resolution
+                    next_token_map = F.interpolate(
+                        f_hat, 
+                        size=(self.patch_nums[cluster_stage_N + 1], self.patch_nums[cluster_stage_N + 1]),
+                        mode='area'
+                    )
+                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                    next_token_map = (
+                        self.word_embed(next_token_map)
+                        + lvl_pos[:, cur_L : cur_L + self.patch_nums[cluster_stage_N + 1] ** 2]
+                    )
+                    next_token_map = next_token_map.repeat(2, 1, 1)  # double for CFG
+            
+            start_stage = cluster_stage_N + 1
+        
         for b in self.blocks:
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
+            # Skip stages that were provided via cluster patches
+            if si < start_stage:
+                continue
             ratio = si / self.num_stages_minus_1
-            if si > 0:
-                cur_L += pn * pn
-            else:
-                cur_L += self.context_token
+            # Update cur_L only if we haven't skipped this stage
+            # (if start_stage > 0, we already accounted for skipped stages)
+            if start_stage == 0:
+                # Normal path: update cur_L for each stage
+                if si > 0:
+                    cur_L += pn * pn
+                else:
+                    cur_L += self.context_token
+            elif si >= start_stage:
+                # We're continuing from a later stage, cur_L was set in setup
+                # Just need to ensure we don't double-count
+                if si > start_stage:
+                    cur_L += pn * pn
             use_cluster_stage = cluster_enabled and si < cluster_warmup_steps
             if use_cluster_stage:
                 stage_cond_BD = cond_BD.clone()
