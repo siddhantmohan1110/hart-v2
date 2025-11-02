@@ -6,7 +6,6 @@ import random
 import time
 from typing import Any, Dict, List, Optional  # helper aliases for readability
 
-import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from transformers import (
@@ -16,7 +15,6 @@ from transformers import (
 )
 
 from hart.modules.models.transformer import HARTForT2I
-from hart.modules.networks.utils import sample_with_top_k_top_p_
 from hart.utils import (
     artificial_prompts,
     default_prompts,
@@ -193,127 +191,6 @@ def _batched_indices(length: int, batch_size: int):
         yield start, min(start + batch_size, length)  # clamp end index to total length
 
 
-def _generate_cluster_stage_patches(
-    model: HARTForT2I,
-    label_B: torch.Tensor,
-    context_position_ids: torch.Tensor,
-    context_mask: torch.Tensor,
-    stage_N: int,
-    cfg: float,
-    g_seed: Optional[int] = None,
-) -> List[torch.Tensor]:
-    if stage_N < 0 or stage_N >= len(model.patch_nums) - 1:
-        raise ValueError(
-            f"stage_N must be between 0 and {len(model.patch_nums) - 2}, got {stage_N}"
-        )  # validate stage bounds against coarse hierarchy
-
-    device = label_B.device  # remember device of centroid embeddings
-    B = label_B.shape[0]  # number of clusters to process
-    if B == 0:
-        raise ValueError("label_B must contain at least one centroid.")  # cannot run without inputs
-
-    if g_seed is None:
-        rng = None  # disable deterministic sampling when no seed is set
-    else:
-        model.rng.manual_seed(g_seed)  # configure shared generator for reproducibility
-        rng = model.rng  # reuse generator in sampling helper
-
-    zero_pad = torch.full_like(label_B, fill_value=0.0)  # unconditional branch for CFG
-    cond_input = torch.cat((label_B, zero_pad), dim=0)  # double batch for conditional/unconditional streams
-    cond_BD = model.context_embed(model.context_norm(cond_input))  # embed text context into model hidden space
-
-    context_position_ids = torch.cat(
-        (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
-        dim=0,
-    )  # extend position ids for unconditional tokens
-    b = context_mask.shape[0]  # original batch size before CFG duplication
-    context_mask = torch.cat(
-        (context_mask, torch.full_like(context_mask, fill_value=0)), dim=0
-    )  # replicate mask structure
-    context_mask[b:, 0] = 1  # keep BOS token unmasked in unconditional branch
-
-    if model.pos_1LC is not None:
-        lvl_pos = model.lvl_embed(model.lvl_1L) + model.pos_1LC  # fetch hierarchical positional encoding
-    else:
-        lvl_pos = model.lvl_embed(model.lvl_1L)  # fallback when no offset tensor
-
-    if model.pos_start is not None:
-        next_token_map = (
-            cond_BD
-            + model.pos_start.expand_as(cond_BD)
-            + lvl_pos[:, : model.first_l]
-        )  # incorporate learned start tokens plus positional term
-    else:
-        next_token_map = cond_BD + lvl_pos[:, : model.first_l]  # simple sum of context and positions
-
-    target_hw = model.patch_nums[-1]  # side length of full-resolution latent grid
-    f_hat = cond_BD.new_zeros(B, model.Cvae, target_hw, target_hw)  # running accumulator of decoded features
-    cur_L = 0  # track how many positional tokens have been consumed
-    cond_BD_or_gss = model.shared_ada_lin(cond_BD)  # pre-compute shared AdaLN conditioning
-
-    patches: List[torch.Tensor] = []  # buffer for per-stage accumulated feature maps
-    for block in model.blocks:  # iterate transformer blocks once to toggle cache
-        block.attn.kv_caching(True)  # enable KV caching for faster auto-reg recurrence
-
-    try:
-        for si, pn in enumerate(model.patch_nums[:-1]):  # iterate autoregressive stages (exclude maskgit)
-            ratio = (
-                si / model.num_stages_minus_1 if model.num_stages_minus_1 > 0 else 0.0
-            )  # normalised stage progress for CFG scaling
-            if si > 0:
-                cur_L += pn * pn  # advance positional offset by number of tokens at previous stage
-            else:
-                cur_L += model.context_token  # first stage consumes text tokens
-
-            x = next_token_map  # transformer input tokens
-            for block in model.blocks:
-                x = block(
-                    x=x,
-                    cond_BD=cond_BD_or_gss,
-                    attn_bias=None,
-                    si=si,
-                    context_position_ids=context_position_ids,
-                    context_mask=context_mask,
-                )  # run standard HART block conditioned on centroids
-
-            logits_BlV = model.get_logits(x, cond_BD)  # project hidden states to VAE codebook logits
-            t = cfg * ratio  # adjust CFG strength by stage
-            logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]  # apply CFG mixing
-            if si == 0:
-                logits_BlV = logits_BlV[:, [-1], :]  # only decode the first SOS token at stage 0
-
-            idx_Bl = sample_with_top_k_top_p_(
-                logits_BlV,
-                rng=rng,
-                top_k=(600 if si < 7 else 300),
-                top_p=0.0,
-                num_samples=1,
-            )[:, :, 0]  # perform top-k sampling tuned for HART
-
-            h_BChw = model.vae_quant_proxy[0].embedding(idx_Bl)  # convert token ids to embedding vectors
-            h_BChw = h_BChw.transpose(1, 2).reshape(B, model.Cvae, pn, pn)  # reshape into spatial feature map
-
-            f_hat, next_token_map = model.vae_quant_proxy[
-                0
-            ].get_next_autoregressive_input(
-                si, len(model.patch_nums), f_hat, h_BChw, patch_nums=model.patch_nums
-            )  # update accumulated feature grid and next token map
-            patches.append(f_hat.detach().clone().cpu())  # store CPU copy of accumulated features
-
-            if si >= stage_N:
-                break  # exit once we reach requested stage
-
-            next_token_map = next_token_map.view(B, model.Cvae, -1).transpose(1, 2)  # flatten spatial map back to tokens
-            lvl_slice = lvl_pos[:, cur_L : cur_L + model.patch_nums[si + 1] ** 2]  # positional slice for next stage tokens
-            next_token_map = model.word_embed(next_token_map) + lvl_slice  # embed tokens and add positional offsets
-            next_token_map = next_token_map.repeat(2, 1, 1)  # duplicate for conditional/unconditional CFG streams
-    finally:
-        for block in model.blocks:  # reset block state even on early exit
-            block.attn.kv_caching(False)  # always disable caching afterwards
-
-    return patches  # accumulated feature maps per stage up to N
-
-
 def generate_cluster_centroid_patches(
     prompts: List[str],
     model: HARTForT2I,
@@ -342,6 +219,11 @@ def generate_cluster_centroid_patches(
 
     model.to(device)  # move HART to desired device
     model.eval()  # disable training-time layers
+
+    if cluster_stage_N < 0 or cluster_stage_N >= len(model.patch_nums) - 1:
+        raise ValueError(
+            f"cluster_stage_N must be between 0 and {len(model.patch_nums) - 2}, got {cluster_stage_N}"
+        )  # ensure requested stage matches available autoregressive stages
 
     with torch.inference_mode():  # no gradients needed anywhere below
         if (
@@ -372,40 +254,14 @@ def generate_cluster_centroid_patches(
         context_position_ids_cpu = context_position_ids.detach().to("cpu", copy=True)  # same for position ids
 
         if cluster_assignments is None:
-            if cluster_method == "kmeans":
-                if num_clusters is None or num_clusters <= 0:
-                    raise ValueError("num_clusters must be positive for kmeans.")  # enforce valid hyperparams
-                if len(prompts) < num_clusters:
-                    raise ValueError(
-                        "num_clusters cannot exceed the number of prompts."
-                    )  # without repeats clustering fails
-                pooled_embeddings = _pool_prompt_embeddings(
-                    context_tensor_cpu,
-                    context_mask_cpu,
-                    truncate_tokens=cluster_truncate_tokens,
-                ).float()  # flatten prompt embeddings for clustering
-                assignments, _ = _run_kmeans(
-                    pooled_embeddings.detach(),
-                    min(num_clusters, len(prompts)),
-                    kmeans_iters,
-                )  # perform lightweight k-means
-                cluster_assignments_cpu = assignments  # capture assignment vector
-            elif cluster_method == "hdbscan":
-                pooled_embeddings = _pool_prompt_embeddings(
-                    context_tensor_cpu,
-                    context_mask_cpu,
-                    truncate_tokens=cluster_truncate_tokens,
-                ).float()  # produce embedding matrix for density clustering
-                assignments, _ = _run_hdbscan(
-                    pooled_embeddings.detach(),
-                    min_cluster_size=max(2, num_clusters or 2),
-                    min_samples=None,
-                )  # fallback to HDBSCAN heuristics
-                cluster_assignments_cpu = assignments  # use HDBSCAN labels
-            else:
-                cluster_assignments_cpu = torch.arange(
-                    len(prompts), dtype=torch.long
-                )  # treat each prompt as its own cluster
+            if cluster_method in {"kmeans", "hdbscan"}:
+                raise ValueError(
+                    "cluster_assignments must be provided when cluster_method is "
+                    f"{cluster_method}."
+                )  # avoid silently re-running clustering here
+            cluster_assignments_cpu = torch.arange(
+                len(prompts), dtype=torch.long
+            )  # treat each prompt as its own cluster
         else:
             cluster_assignments_cpu = cluster_assignments.detach().to("cpu").long()  # reuse provided assignments
 
@@ -448,15 +304,31 @@ def generate_cluster_centroid_patches(
         cluster_context_mask_device = cluster_context_mask_cpu.to(device=device)  # move masks to device
         cluster_position_ids_device = cluster_position_ids_cpu.to(device=device)  # move position ids to device
 
-        patches = _generate_cluster_stage_patches(
-            model=model,
+        patches: List[torch.Tensor] = []
+
+        def _collect_stage(stage_idx: int, f_hat_stage: torch.Tensor) -> None:
+            if stage_idx <= cluster_stage_N:
+                patches.append(f_hat_stage.cpu().clone())
+
+        model.autoregressive_infer_cfg(
+            B=cluster_context_tensor_device.size(0),
             label_B=cluster_context_tensor_device,
+            g_seed=seed,
+            cfg=cfg,
             context_position_ids=cluster_position_ids_device,
             context_mask=cluster_context_mask_device,
-            stage_N=cluster_stage_N,
-            cfg=cfg,
-            g_seed=seed,
-        )  # compute accumulated feature maps up to requested stage
+            cluster_assignments=None,
+            cluster_context_tensor=None,
+            cluster_warmup_steps=0,
+            save_autoregressive_steps=False,
+            stage_callback=_collect_stage,
+        )
+
+        if len(patches) < cluster_stage_N + 1:
+            raise RuntimeError(
+                f"Expected at least {cluster_stage_N + 1} patches, "
+                f"but only collected {len(patches)}."
+            )
 
         output_dir = os.path.dirname(output_path)  # locate parent directory of save path
         if output_dir:
@@ -573,7 +445,7 @@ def main(args):
 
             (
                 _, #context_tokens
-                context_mask, # marking every osition that isn't the tokenizer's pad token
+                context_mask, # marking every position that isn't the tokenizer's pad token
                 context_position_ids, #  produces 1, 2, 3 wherever the mask is true and holds the previous value where it’s false
                 context_tensor, #output of last hidden state
             ) = encode_prompts(
@@ -877,7 +749,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cluster_centroid_stage",
         type=int,
-        default=None,
+        default=3,
         help="0-indexed stage up to which centroid patches are generated.",
     )  # specify which stage's accumulated features to cache
     parser.add_argument(

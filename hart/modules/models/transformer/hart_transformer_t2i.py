@@ -6,7 +6,7 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 import math
 import os
 from functools import partial
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Callable, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.stats as stats
@@ -368,6 +368,7 @@ class HARTForT2I(PreTrainedModel):
         store_seperately: bool = False,
         prompts: Optional[Sequence[str]] = None,
         prompt_offset: int = 0,
+        stage_callback: Optional[Callable[[int, torch.Tensor], None]] = None,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -389,6 +390,8 @@ class HARTForT2I(PreTrainedModel):
             f_hat at each stage up to N. The last element should be the complete f_hat at stage N.
         :param cluster_stage_N: Stage number (0-indexed) to start generation from. Stages 0 to N 
             are skipped and replaced by the provided patches. Must satisfy: 0 <= cluster_stage_N < len(patch_nums)-1
+        :param stage_callback: Optional callable invoked after each autoregressive stage with
+            (stage_index, current_f_hat). Useful for collecting intermediate feature maps.
         :return: Generated images as tensor (B, 3, H, W) in range [0, 1]
         """
         # num_maskgit_iters = 1
@@ -608,6 +611,8 @@ class HARTForT2I(PreTrainedModel):
                 si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
             )
             record_stage_output(f"stage_{si:02d}")
+            if stage_callback is not None:
+                stage_callback(si, f_hat.detach())
             stage_counter += 1
 
             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
