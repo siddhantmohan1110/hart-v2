@@ -24,7 +24,9 @@ from hart.utils import (
     llm_system_prompt,
     safety_check,
 )
-
+#setting pca to true by default, used this in hdbscan and K-means to cluster.
+PCA=True
+TOP_N_COMPONENTS=100
 
 def save_images(
     sample_imgs,
@@ -126,10 +128,17 @@ def _run_kmeans(embeddings, num_clusters, num_iters=20):
     num_points = embeddings.shape[0] #batch_size
     if num_clusters > num_points:
         raise ValueError("num_clusters cannot exceed the number of embeddings.")
-    centroids = embeddings[torch.randperm(num_points)[:num_clusters]].clone()
+    working_embeddings = embeddings.detach()
+    if PCA:
+        working_embeddings = working_embeddings.float()
+        num_components = min(TOP_N_COMPONENTS, *working_embeddings.shape)
+        if num_components > 0:
+            _, _, v = torch.pca_lowrank(working_embeddings, q=num_components)
+            working_embeddings = working_embeddings @ v[:, :num_components]
+    centroids = working_embeddings[torch.randperm(num_points)[:num_clusters]].clone()
     assignments = torch.zeros(num_points, dtype=torch.long)
     for _ in range(max(num_iters, 1)):
-        distances = torch.cdist(embeddings, centroids)
+        distances = torch.cdist(working_embeddings, centroids)
         new_assignments = distances.argmin(dim=1)
         if torch.equal(assignments, new_assignments):
             assignments = new_assignments
@@ -138,12 +147,12 @@ def _run_kmeans(embeddings, num_clusters, num_iters=20):
         for idx in range(num_clusters):
             mask = assignments == idx
             if mask.any():
-                centroids[idx] = embeddings[mask].mean(dim=0)
+                centroids[idx] = working_embeddings[mask].mean(dim=0)
             else:
                 replacement_idx = torch.randint(0, num_points, ()).item()
-                centroids[idx] = embeddings[replacement_idx]
+                centroids[idx] = working_embeddings[replacement_idx]
     else:
-        distances = torch.cdist(embeddings, centroids)
+        distances = torch.cdist(working_embeddings, centroids)
         assignments = distances.argmin(dim=1)
     return assignments, centroids
 
@@ -157,7 +166,18 @@ def _run_hdbscan(embeddings, min_cluster_size=5, min_samples=None):
             "Install it with `pip install hdbscan`."
         ) from exc
 
-    embeddings_np = embeddings.detach().cpu().numpy()
+    # embeddings_np = embeddings.detach().cpu().numpy()
+    embedding_tensor = embeddings.detach()  # stays torch.Tensor
+    if PCA:
+        embedding_tensor = embedding_tensor.float()
+        num_components = min(TOP_N_COMPONENTS, *embedding_tensor.shape)
+        if num_components > 0:
+            _, _, v = torch.pca_lowrank(embedding_tensor, q=num_components)
+            embedding_tensor = embedding_tensor @ v[:, :num_components]
+
+    embeddings_np = embedding_tensor.cpu().numpy()
+
+
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size, min_samples=min_samples
     )
