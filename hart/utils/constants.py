@@ -24,7 +24,7 @@ User Prompt:\n"""
 max_seq_len = 10240
 max_batch_size = 16
 
-artificial_prompts = [
+artificial_prompts3 = [
     # Group 1 — Landscapes & Nature
     "A misty mountain valley at sunrise with a river flowing through pine forests.",
     "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
@@ -62,7 +62,28 @@ artificial_prompts2 = [
     "A misty mountain valley at sunrise with a river flowing through pine forests.",
     "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
     "A tropical beach with turquoise waters and palm trees swaying in the wind.",
-    "A desert landscape with red sand dunes and a caravan of camels at dusk.",
+    "A desert landscape with red sand dunes and a caravan of camels at dusk.",  
+]
 
-    
+artificial_prompts = [
+    "A black cat jumping from a vintage mountain",
+    "A black cat smoking cigar in a mosaic painting",
+    "A black cat laughing on vintage street",
+    "A black cat dancing under a vintage lamp",
+    "A black cat painting on an old brick wall",
+    "A black cat reading a newspaper in a sepia café",
+    "A black cat riding a bicycle on a cobblestone street",
+    "A black cat sipping tea in a vintage train",
+    "A black cat playing violin on an antique balcony",
+    "A black cat wearing a hat in a retro portrait",
+    "A black cat posing beside an old phonograph",
+    "A black cat resting on a Victorian chair",
+    "A black cat dreaming in a faded oil painting",
+    "A black cat walking through an art deco alley",
+    "A black cat sketching on a rustic canvas",
+    "A black cat gazing at lanterns in a vintage fair",
+    "A black cat writing letters on an antique desk",
+    "A black cat standing near a classic typewriter",
+    "A black cat singing beside a gramophone",
+    "A black cat smoking pipe in a faded mural"
 ]

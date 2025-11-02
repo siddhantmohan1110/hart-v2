@@ -8,8 +8,7 @@ from typing import Any, Dict, List, Optional  # helper aliases for readability
 
 import numpy as np
 import torch
-import torchvision
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from transformers import (
     AutoModel,
     AutoModelForCausalLM,
@@ -27,29 +26,85 @@ from hart.utils import (
 )
 
 
-def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
-    if not store_separately and len(sample_imgs) > 1:
-        grid = torchvision.utils.make_grid(sample_imgs, nrow=12)
-        grid_np = grid.to(torch.float16).permute(1, 2, 0).mul_(255).cpu().numpy()
-
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        grid_np = Image.fromarray(grid_np.astype(np.uint8))
-        grid_np.save(os.path.join(sample_folder_dir, f"sample_images.png"))
-        print(f"Example images are saved to {sample_folder_dir}")
+def save_images(
+    sample_imgs,
+    sample_folder_dir,
+    store_separately,
+    prompts,
+    cluster_assignments=None,
+    save_individual=False,
+):
+    os.makedirs(sample_folder_dir, exist_ok=True)
+    if isinstance(cluster_assignments, torch.Tensor):
+        cluster_list = [int(c.item()) for c in cluster_assignments.detach().cpu()]
+    elif cluster_assignments is not None:
+        cluster_list = [int(c) for c in cluster_assignments]
     else:
-        # bs, 3, r, r
-        sample_imgs_np = sample_imgs.mul_(255).cpu().numpy()
-        num_imgs = sample_imgs_np.shape[0]
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        for img_idx in range(num_imgs):
-            cur_img = sample_imgs_np[img_idx]
-            cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
-            cur_img_store = Image.fromarray(cur_img)
-            cur_img_store.save(os.path.join(sample_folder_dir, f"{img_idx:06d}.png"))
-            print(f"Image {img_idx} saved.")
+        cluster_list = ["none"] * len(prompts)
 
-    with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
-        f.write("\n".join(prompts))
+    sample_imgs = sample_imgs.clamp(0.0, 1.0)
+    sample_imgs_uint8 = (
+        sample_imgs.mul(255).add_(0.5).clamp(0, 255).to(torch.uint8).cpu()
+    )
+    num_imgs = sample_imgs_uint8.shape[0]
+    pil_images = []
+    for img_idx in range(num_imgs):
+        img_np = sample_imgs_uint8[img_idx].permute(1, 2, 0).numpy()
+        pil_img = Image.fromarray(img_np)
+        pil_images.append(pil_img)
+        cluster_id = cluster_list[img_idx] if img_idx < len(cluster_list) else "none"
+        if save_individual:
+            filename = os.path.join(
+                sample_folder_dir,
+                f"{img_idx:06d}_prompt{img_idx}_cluster{cluster_id}.png",
+            )
+            pil_img.save(filename)
+            print(f"Image {img_idx} saved as {filename}.")
+
+    prompt_lines = []
+    for idx, prompt in enumerate(prompts):
+        cluster_id = cluster_list[idx] if idx < len(cluster_list) else "none"
+        prompt_lines.append(f"{idx}\tcluster:{cluster_id}\t{prompt}")
+    with open(os.path.join(sample_folder_dir, "prompts.txt"), "w") as f:
+        f.write("\n".join(prompt_lines))
+
+    if not pil_images:
+        return
+
+    font = ImageFont.load_default()
+    grid_cols, grid_rows = 4, 4
+    grid_capacity = grid_cols * grid_rows
+    tile_w, tile_h = pil_images[0].size
+    for grid_idx, start in enumerate(range(0, num_imgs, grid_capacity)):
+        indices = list(range(start, min(start + grid_capacity, num_imgs)))
+        grid_image = Image.new("RGB", (grid_cols * tile_w, grid_rows * tile_h))
+        draw = ImageDraw.Draw(grid_image)
+        for pos, img_idx in enumerate(indices):
+            row, col = divmod(pos, grid_cols)
+            x_offset = col * tile_w
+            y_offset = row * tile_h
+            grid_image.paste(pil_images[img_idx], (x_offset, y_offset))
+            cluster_id = cluster_list[img_idx] if img_idx < len(cluster_list) else "none"
+            label_text = f"idx {img_idx} | cluster {cluster_id}"
+            if hasattr(draw, "textbbox"):
+                left, top, right, bottom = draw.textbbox(
+                    (0, 0), label_text, font=font
+                )
+                text_w, text_h = right - left, bottom - top
+            else:
+                text_w, text_h = font.getsize(label_text)
+            text_x = x_offset + 4
+            text_y = y_offset + tile_h - text_h - 6
+            draw.rectangle(
+                [text_x - 2, text_y - 2, text_x + text_w + 2, text_y + text_h + 2],
+                fill=(0, 0, 0),
+            )
+            draw.text((text_x, text_y), label_text, fill=(255, 255, 255), font=font)
+        grid_path = os.path.join(
+            sample_folder_dir, f"sample_grid_{grid_idx:02d}.png"
+        )
+        grid_image.save(grid_path)
+        print(f"Grid image saved to {grid_path}")
 
 
 def _pool_prompt_embeddings(context_tensor, context_mask, truncate_tokens=None):
@@ -694,7 +749,12 @@ def main(args):
     )
 
     save_images(
-        output_imgs.clone(), args.sample_folder_dir, args.store_seperately, prompts
+        output_imgs.clone(),
+        args.sample_folder_dir,
+        args.store_seperately,
+        prompts,
+        cluster_assignments=cluster_assignments,
+        save_individual=args.save_individual_images,
     )
 
 
@@ -799,9 +859,15 @@ if __name__ == "__main__":
         action="store_true",
     )
     parser.add_argument(
+        "--save_individual_images",
+        action="store_true",
+        help="If set, save each generated image with prompt and cluster metadata in the filename.",
+    )
+    parser.add_argument(
         "--save_autoregressive_steps",
         help="Enable saving intermediate autoregressive stage images.",
-        action="store_true",
+        type=bool,
+        default=True,
     )
     parser.add_argument(
         "--save_cluster_centroid_patches",
