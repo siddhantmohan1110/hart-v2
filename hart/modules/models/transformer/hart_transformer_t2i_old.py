@@ -6,15 +6,12 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 import math
 import os
 from functools import partial
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from PIL import Image
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
@@ -36,49 +33,6 @@ from hart.modules.networks.utils import (
     sample_with_top_k_top_p_,
 )
 from hart.utils import get_device
-
-
-def save_images(
-    sample_imgs: torch.Tensor,
-    sample_folder_dir: str,
-    store_seperately: bool,
-    prompts: Sequence[str],
-) -> None:
-    """Persist a batch of images (float tensor in [0, 1]) to disk."""
-    if sample_imgs.ndim != 4:
-        raise ValueError("sample_imgs must be a 4D tensor (N, C, H, W).")
-
-    os.makedirs(sample_folder_dir, exist_ok=True)
-    sample_imgs = sample_imgs.detach().cpu()
-
-    if not store_seperately and sample_imgs.shape[0] > 1:
-        grid = torchvision.utils.make_grid(
-            sample_imgs, nrow=min(12, sample_imgs.shape[0])
-        )
-        grid_np = (
-            grid.mul(255.0)
-            .clamp_(0.0, 255.0)
-            .permute(1, 2, 0)
-            .to(torch.uint8)
-            .numpy()
-        )
-        Image.fromarray(grid_np).save(os.path.join(sample_folder_dir, "sample_images.png"))
-    else:
-        imgs_uint8 = (
-            sample_imgs.mul(255.0)
-            .clamp_(0.0, 255.0)
-            .permute(0, 2, 3, 1)
-            .to(torch.uint8)
-            .numpy()
-        )
-        for img_idx, cur_img in enumerate(imgs_uint8):
-            Image.fromarray(cur_img).save(
-                os.path.join(sample_folder_dir, f"{img_idx:06d}.png")
-            )
-
-    if prompts:
-        with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
-            f.write("\n".join(prompts))
 
 
 def mask_by_order(mask_len, order, bsz, seq_len):
@@ -203,7 +157,7 @@ class HARTForT2I(PreTrainedModel):
         #     dtype=torch.float32,
         #     device=get_device(),
         # )
-        self.context_token_len = context_token
+        self.context_token = context_token
         self.context_dim = context_dim
         self.context_shape = (context_token, context_dim)
         self.context_embed = nn.Linear(context_dim, self.D)
@@ -213,7 +167,7 @@ class HARTForT2I(PreTrainedModel):
             self.context_norm = nn.Identity()
 
         nn.init.trunc_normal_(self.context_embed.weight.data, mean=0, std=init_std)
-        if attn_type == "gpt2" or self.context_token_len == 0:
+        if attn_type == "gpt2" or self.context_token == 0:
             # gpt2 uses absolute pos emb for context tokens
             # c2i also adds this absolute pos emb
             self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
@@ -276,7 +230,7 @@ class HARTForT2I(PreTrainedModel):
                     max_position_embeddings=2
                     ** int(math.ceil(math.log2(self.L + context_token - 1))),
                     patch_nums=self.patch_nums,
-                    context_token=self.context_token_len,
+                    context_token=self.context_token,
                     disable_aln=self.disable_aln,
                     sep_aln_pooling_mode=self.sep_aln_pooling_mode,
                     use_cross_attn=self.use_cross_attn,
@@ -358,38 +312,17 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
-        cluster_assignments: Optional[torch.LongTensor] = None,
-        cluster_context_tensor: Optional[torch.Tensor] = None,
-        cluster_warmup_steps: int = 0,
-        cluster_centroid_patches: Optional[List[torch.Tensor]] = None,
-        cluster_stage_N: Optional[int] = None,
-        save_autoregressive_steps: bool = False,
-        sample_folder_dir: Optional[str] = None,
-        store_seperately: bool = False,
-        prompts: Optional[Sequence[str]] = None,
-        prompt_offset: int = 0,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
-        
-        This function can optionally use pre-computed cluster centroid patches to skip the early
-        stages of generation. When cluster_centroid_patches and cluster_stage_N are provided:
-        - Stages 0 through N are skipped
-        - Generation starts from stage N+1 using the provided accumulated f_hat feature map
-        - The next_token_map is computed from the last provided patch
-        
         :param B: batch size
-        :param label_B: context conditioning tensor (e.g., text embeddings)
-        :param g_seed: random seed for reproducibility
+        :param label_B: imagenet label; if None, randomly sampled
+        :param g_seed: random seed
         :param cfg: classifier-free guidance ratio
-        :param top_k: top-k sampling threshold
-        :param top_p: top-p (nucleus) sampling threshold
-        :param more_smooth: use gumbel softmax for smoother sampling (not used in benchmarking)
-        :param cluster_centroid_patches: List of feature maps (B, Cvae, H, W) representing accumulated 
-            f_hat at each stage up to N. The last element should be the complete f_hat at stage N.
-        :param cluster_stage_N: Stage number (0-indexed) to start generation from. Stages 0 to N 
-            are skipped and replaced by the provided patches. Must satisfy: 0 <= cluster_stage_N < len(patch_nums)-1
-        :return: Generated images as tensor (B, 3, H, W) in range [0, 1]
+        :param top_k: top-k sampling
+        :param top_p: top-p sampling
+        :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
         # num_maskgit_iters = 1
         # final_stage = 2
@@ -399,68 +332,13 @@ class HARTForT2I(PreTrainedModel):
             self.rng.manual_seed(g_seed)
             rng = self.rng
         assert label_B is not None
-        assert label_B.shape[1] == self.context_token_len
-
-        record_intermediate = (
-            save_autoregressive_steps and sample_folder_dir is not None
-        )
-        intermediate_dir: Optional[str] = None
-        base_prompts = list(prompts) if prompts is not None else []
-        stage_images_per_prompt: List[List[torch.Tensor]] = []
-        if record_intermediate:
-            intermediate_dir = os.path.join(
-                sample_folder_dir, "autoregressive_steps"
-            )
-            os.makedirs(intermediate_dir, exist_ok=True)
-            stage_images_per_prompt = [[] for _ in range(B)]
-
-        stage_counter = 0
-
-        def record_stage_output(label: str) -> None:
-            if not record_intermediate:
-                return
-            stage_imgs = self.vae_proxy[0].fhat_to_img(f_hat)
-            stage_imgs = stage_imgs.add(1).mul(0.5)
-            stage_imgs = stage_imgs.clamp_(0.0, 1.0).detach().cpu()
-            for prompt_idx, img in enumerate(stage_imgs):
-                stage_images_per_prompt[prompt_idx].append(img)
+        assert label_B.shape[1] == self.context_token
 
         sos = cond_BD = self.context_embed(
             self.context_norm(
                 torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
             )
         )
-
-        
-        
-        cluster_enabled = (
-            cluster_assignments is not None
-            and cluster_context_tensor is not None
-            and cluster_warmup_steps > 0
-        )
-
-        if cluster_enabled:
-            cluster_assignments = cluster_assignments.to(
-                label_B.device, dtype=torch.long
-            )
-            cluster_assignments = cluster_assignments.view(B)
-            cluster_context_tensor = cluster_context_tensor.to(
-                label_B.device, dtype=label_B.dtype
-            )
-            cluster_warmup_steps = min(
-                cluster_warmup_steps, max(len(self.patch_nums) - 1, 0)
-            )
-            cluster_cond = self.context_embed(
-                self.context_norm(cluster_context_tensor)
-            ).to(cond_BD.dtype)
-            cluster_sos = cluster_cond[:, : self.first_l, :]
-            cond_BD[B:, : self.first_l, :] = cluster_sos[cluster_assignments]
-            sos = cond_BD
-        else:
-            cluster_warmup_steps = 0
-            cluster_cond = None
-            cluster_sos = None
-
         # Haotian: need to handle CFG here so we replicate context position ids
         context_position_ids = torch.cat(
             (context_position_ids, torch.full_like(context_position_ids, fill_value=0)),
@@ -478,92 +356,32 @@ class HARTForT2I(PreTrainedModel):
         else:
             lvl_pos = self.lvl_embed(self.lvl_1L)
 
-        if cluster_enabled:
-            base_context = cluster_sos[cluster_assignments]
-            base_context = torch.cat((base_context, cluster_sos[cluster_assignments]), dim=0)
-        else:
-            base_context = sos
-
         if self.pos_start is not None:
             next_token_map = (
-                base_context
-                + self.pos_start.expand_as(base_context)
+                sos.expand(2 * B, self.first_l, -1)
+                + self.pos_start.expand(2 * B, self.first_l, -1)
                 + lvl_pos[:, : self.first_l]
             )
         else:
-            next_token_map = base_context + lvl_pos[:, : self.first_l]
+            next_token_map = (
+                sos.expand(2 * B, self.first_l, -1) + lvl_pos[:, : self.first_l]
+            )
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
-        
-        # Check if we should use pre-computed cluster centroid patches
-        start_stage = 0
-        if cluster_centroid_patches is not None and cluster_stage_N is not None:
-            if cluster_stage_N < 0 or cluster_stage_N >= len(self.patch_nums) - 1:
-                raise ValueError(f"cluster_stage_N must be between 0 and {len(self.patch_nums) - 2}, got {cluster_stage_N}")
-            
-            # cluster_centroid_patches should be the accumulated f_hat at each stage
-            # The last patch is the complete f_hat at stage cluster_stage_N
-            if len(cluster_centroid_patches) > 0:
-                # Use the last patch as the accumulated f_hat
-                f_hat = cluster_centroid_patches[-1]
-                
-                # Calculate cur_L for the stages we're skipping
-                for si in range(cluster_stage_N + 1):
-                    if si == 0:
-                        cur_L += self.context_token_len
-                    else:
-                        cur_L += self.patch_nums[si] * self.patch_nums[si]
-                
-                # Get the next token map from f_hat
-                if cluster_stage_N < len(self.patch_nums) - 2:
-                    # Downsample to next stage resolution
-                    next_token_map = F.interpolate(
-                        f_hat, 
-                        size=(self.patch_nums[cluster_stage_N + 1], self.patch_nums[cluster_stage_N + 1]),
-                        mode='area'
-                    )
-                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                    next_token_map = (
-                        self.word_embed(next_token_map)
-                        + lvl_pos[:, cur_L : cur_L + self.patch_nums[cluster_stage_N + 1] ** 2]
-                    )
-                    next_token_map = next_token_map.repeat(2, 1, 1)  # double for CFG
-            
-            start_stage = cluster_stage_N + 1
-        
+
         for b in self.blocks:
             b.attn.kv_caching(True)
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
-            # Skip stages that were provided via cluster patches
-            if si < start_stage:
-                continue
             ratio = si / self.num_stages_minus_1
-            # Update cur_L only if we haven't skipped this stage
-            # (if start_stage > 0, we already accounted for skipped stages)
-            if start_stage == 0:
-                # Normal path: update cur_L for each stage
-                if si > 0:
-                    cur_L += pn * pn #current length
-                else:
-                    cur_L += self.context_token_len #start_length=300
-            elif si >= start_stage:
-                # We're continuing from a later stage, cur_L was set in setup
-                # Just need to ensure we don't double-count
-                if si > start_stage:
-                    cur_L += pn * pn
-            use_cluster_stage = cluster_enabled and si < cluster_warmup_steps
-            if use_cluster_stage:
-                stage_cond_BD = cond_BD.clone()
-                stage_cond_BD[:B, : self.first_l, :] = cluster_sos[cluster_assignments]
+            # last_L = cur_L
+            if si > 0:
+                cur_L += pn * pn
             else:
-                stage_cond_BD = cond_BD
-            cond_BD_or_gss = self.shared_ada_lin(stage_cond_BD)
+                cur_L += self.context_token
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
-            if use_cluster_stage:
-                x = x.clone()
-                slice_len = min(self.first_l, x.shape[1])
-                #x[:B, :slice_len, :] = cluster_sos[cluster_assignments, :slice_len, :]
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 # Haotian: si used for position embed
@@ -575,7 +393,7 @@ class HARTForT2I(PreTrainedModel):
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                 )
-            logits_BlV = self.get_logits(x, stage_cond_BD)
+            logits_BlV = self.get_logits(x, cond_BD)
             if si == self.num_stages_minus_1:
                 last_layer_cond = x
 
@@ -607,8 +425,6 @@ class HARTForT2I(PreTrainedModel):
             ].get_next_autoregressive_input(
                 si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
             )
-            record_stage_output(f"stage_{si:02d}")
-            stage_counter += 1
 
             next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
             next_token_map = (
@@ -618,8 +434,6 @@ class HARTForT2I(PreTrainedModel):
             next_token_map = next_token_map.repeat(
                 2, 1, 1
             )  # double the batch sizes due to CFG
-
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
@@ -708,47 +522,14 @@ class HARTForT2I(PreTrainedModel):
             B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]
         )
         f_hat += h_BChw_final
-        record_stage_output(f"stage_{len(self.patch_nums) - 1:02d}_final")
 
         ################ last stage maskgit ################
 
-        final_imgs = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
-
-        if record_intermediate:
-            assert intermediate_dir is not None
-            grid_cols = 4
-            grid_cells = grid_cols * grid_cols
-            for prompt_idx, images in enumerate(stage_images_per_prompt):
-                if not images:
-                    continue
-                stack = torch.stack(images, dim=0)
-                if stack.shape[0] < grid_cells:
-                    pad = stack[-1:].repeat(grid_cells - stack.shape[0], 1, 1, 1)
-                    stack = torch.cat([stack, pad], dim=0)
-                elif stack.shape[0] > grid_cells:
-                    stack = stack[:grid_cells]
-                grid = torchvision.utils.make_grid(stack, nrow=grid_cols)
-                grid_np = (
-                    grid.mul(255.0)
-                    .clamp_(0.0, 255.0)
-                    .permute(1, 2, 0)
-                    .to(torch.uint8)
-                    .numpy()
-                )
-                global_idx = prompt_offset + prompt_idx
-                Image.fromarray(grid_np).save(
-                    os.path.join(intermediate_dir, f"{global_idx:04d}_stages.png")
-                )
-            if base_prompts:
-                prompts_path = os.path.join(intermediate_dir, "prompts.txt")
-                with open(prompts_path, "a") as f:
-                    for prompt_idx, prompt in enumerate(base_prompts):
-                        global_idx = prompt_offset + prompt_idx
-                        f.write(f"{global_idx:04d}: {prompt}\n")
-
         for b in self.blocks:
             b.attn.kv_caching(False)
-        return final_imgs  # de-normalize, from [-1, 1] to [0, 1]
+        return (
+            self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+        )  # de-normalize, from [-1, 1] to [0, 1]
 
     def sample_orders(self, bsz):
         # generate a batch of random generation orders
@@ -769,7 +550,7 @@ class HARTForT2I(PreTrainedModel):
         mask = torch.zeros(bsz, seq_len, device=x.device)
         # all first few stages are kept
         mask_keep = torch.zeros(
-            bsz, self.L - seq_len + self.context_token_len - 1, device=x.device
+            bsz, self.L - seq_len + self.context_token - 1, device=x.device
         )
         mask = torch.scatter(
             mask,
@@ -797,14 +578,14 @@ class HARTForT2I(PreTrainedModel):
         bg, ed = (
             self.begin_ends[self.prog_si]
             if self.prog_si >= 0
-            else (0, self.L + self.context_token_len - 1)
+            else (0, self.L + self.context_token - 1)
         )
         B = x_BLCv_wo_first_l.shape[0]
         orders = self.sample_orders(bsz=B)
         mask, mask_wo_prev_stages = self.random_masking(
             x_BLCv_wo_first_l[:, -self.last_level_pns :, :], orders
         )
-        mask_for_attn = (1 - mask)[:, self.context_token_len :].nonzero(as_tuple=True)
+        mask_for_attn = (1 - mask)[:, self.context_token :].nonzero(as_tuple=True)
         mask = (1 - mask).nonzero(as_tuple=True)
         mask_wo_prev_stages = (1 - mask_wo_prev_stages).nonzero(as_tuple=True)
         last_layer_gt = last_layer_gt[mask_wo_prev_stages].reshape(
@@ -816,7 +597,7 @@ class HARTForT2I(PreTrainedModel):
         ed = (
             last_layer_gt.shape[1]
             + self.L
-            + self.context_token_len
+            + self.context_token
             - 1
             - self.last_level_pns
         )
@@ -888,7 +669,7 @@ class HARTForT2I(PreTrainedModel):
         # parallel generation of discrete and continuous tokens
         x_BLC_logits, last_layer_cond = (
             x_BLC,
-            x_BLC[:, self.L + self.context_token_len - 1 - self.last_level_pns :, :],
+            x_BLC[:, self.L + self.context_token - 1 - self.last_level_pns :, :],
         )
 
         x_BLC_logits = self.get_logits(x_BLC_logits.float(), cond_BD)
@@ -899,7 +680,7 @@ class HARTForT2I(PreTrainedModel):
             try:
                 idx_BL_sampled = sample_with_top_k_top_p_(
                     x_BLC_logits[
-                        :, self.L + self.context_token_len - 1 - self.last_level_pns :
+                        :, self.L + self.context_token - 1 - self.last_level_pns :
                     ]
                     .clone()
                     .detach(),
@@ -920,7 +701,7 @@ class HARTForT2I(PreTrainedModel):
         )
         # Haotian: important, we should start from self.context_token - 1.
         return (
-            x_BLC_logits[:, self.context_token_len - 1 :, :],
+            x_BLC_logits[:, self.context_token - 1 :, :],
             diff_loss,
             mask_wo_prev_stages,
         )  # logits BLV, V is vocab_size
