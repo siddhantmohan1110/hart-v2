@@ -6,7 +6,7 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 import math
 import os
 from functools import partial
-from typing import List, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.stats as stats
@@ -343,6 +343,198 @@ class HARTForT2I(PreTrainedModel):
         loss = self.diffloss(z=z, target=target, mask=mask)
         return loss
 
+    def _initial_cur_L(self, start_stage: int) -> int:
+        if start_stage <= 0:
+            return 0
+        cur_L = int(self.context_token)
+        for stage_idx in range(1, start_stage):
+            cur_L += int(self.patch_nums[stage_idx]) ** 2
+        return cur_L
+
+    @torch.no_grad()
+    def _cluster_warmup_forward(
+        self,
+        label_B: torch.Tensor,
+        context_position_ids: torch.Tensor,
+        context_mask: torch.Tensor,
+        num_steps: int,
+        cfg: float,
+        top_p: float,
+        more_smooth: bool,
+        rng: Optional[torch.Generator],
+    ) -> Dict[str, torch.Tensor]:
+        if num_steps <= 0:
+            raise ValueError("num_steps must be positive for cluster warmup.")
+        if self.num_stages_minus_1 <= 0:
+            raise RuntimeError("Model does not define autoregressive stages.")
+
+        num_steps = min(num_steps, self.num_stages_minus_1)
+        cluster_B = label_B.shape[0]
+        if cluster_B == 0:
+            raise ValueError("cluster warmup requires at least one cluster center.")
+
+        device = next(self.parameters()).device
+        label_B = label_B.to(device)
+        context_position_ids = context_position_ids.to(device)
+        context_mask = context_mask.to(device)
+
+        cond_input = torch.cat(
+            (label_B, torch.full_like(label_B, fill_value=0.0)), dim=0
+        )
+        cond_BD = self.context_embed(self.context_norm(cond_input))
+
+        context_position_ids = torch.cat(
+            (
+                context_position_ids,
+                torch.full_like(context_position_ids, fill_value=0),
+            ),
+            dim=0,
+        )
+        context_mask = torch.cat(
+            (context_mask, torch.full_like(context_mask, fill_value=0))
+        )
+        context_mask[cluster_B:, 0] = 1
+
+        if self.pos_1LC is not None:
+            lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
+        else:
+            lvl_pos = self.lvl_embed(self.lvl_1L)
+
+        if self.pos_start is not None:
+            next_token_map = (
+                cond_BD
+                + self.pos_start.expand_as(cond_BD)
+                + lvl_pos[:, : self.first_l]
+            )
+        else:
+            next_token_map = cond_BD + lvl_pos[:, : self.first_l]
+
+        f_hat = cond_BD.new_zeros(
+            cluster_B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1]
+        )
+        cur_L = 0
+        warmup_next = None
+
+        for b in self.blocks:
+            b.attn.kv_caching(True)
+
+        for si in range(self.num_stages_minus_1):
+            pn = self.patch_nums[si]
+            ratio = (
+                si / self.num_stages_minus_1 if self.num_stages_minus_1 > 0 else 0.0
+            )
+            if si > 0:
+                cur_L += pn * pn
+            else:
+                cur_L += self.context_token
+
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            x = next_token_map
+            for b in self.blocks:
+                x = b(
+                    x=x,
+                    cond_BD=cond_BD_or_gss,
+                    attn_bias=None,
+                    si=si,
+                    context_position_ids=context_position_ids,
+                    context_mask=context_mask,
+                )
+
+            logits_BlV = self.get_logits(x, cond_BD)
+            t = cfg * ratio
+            logits_BlV = (1 + t) * logits_BlV[:cluster_B] - t * logits_BlV[cluster_B:]
+            if si == 0:
+                logits_BlV = logits_BlV[:, [-1], :]
+
+            idx_Bl = sample_with_top_k_top_p_(
+                logits_BlV,
+                rng=rng,
+                top_k=(600 if si < 7 else 300),
+                top_p=top_p,
+                num_samples=1,
+            )[:, :, 0]
+
+            if not more_smooth:
+                h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)
+            else:
+                gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)
+                h_BChw = gumbel_softmax_with_rng(
+                    logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+                ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+
+            h_BChw = h_BChw.transpose_(1, 2).reshape(cluster_B, self.Cvae, pn, pn)
+
+            f_hat, next_token_map = self.vae_quant_proxy[
+                0
+            ].get_next_autoregressive_input(
+                si, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
+            )
+
+            next_token_map = next_token_map.view(cluster_B, self.Cvae, -1).transpose(
+                1, 2
+            )
+            next_token_map = (
+                self.word_embed(next_token_map)
+                + lvl_pos[:, cur_L : cur_L + self.patch_nums[si + 1] ** 2]
+            )
+
+            if si + 1 == num_steps:
+                warmup_next = next_token_map.clone()
+                break
+
+            next_token_map = next_token_map.repeat(2, 1, 1)
+
+        for b in self.blocks:
+            b.attn.kv_caching(False)
+
+        if warmup_next is None:
+            raise RuntimeError("Failed to capture warmup next_token_map.")
+
+        f_hat_detached = f_hat.detach()
+        warmup_next_detached = warmup_next.detach()
+        return {
+            "cluster_patch_bank": f_hat_detached,
+            "f_hat": f_hat_detached,
+            "next_token_map": warmup_next_detached,
+            "num_steps": num_steps,
+        }
+
+    @torch.no_grad()
+    def prepare_cluster_warmup_cache(
+        self,
+        cluster_label_B: torch.Tensor,
+        cluster_context_position_ids: torch.Tensor,
+        cluster_context_mask: torch.Tensor,
+        cluster_warmup_steps: int,
+        cfg: float,
+        top_p: float = 0.0,
+        more_smooth: bool = False,
+        g_seed: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if cluster_warmup_steps <= 0:
+            raise ValueError("cluster_warmup_steps must be positive to prepare cache.")
+
+        device = next(self.parameters()).device
+        cluster_label_B = cluster_label_B.to(device)
+        cluster_context_position_ids = cluster_context_position_ids.to(device)
+        cluster_context_mask = cluster_context_mask.to(device)
+
+        rng: Optional[torch.Generator] = None
+        if g_seed is not None:
+            rng = CopyableGenerator(device=device)
+            rng.manual_seed(g_seed)
+
+        return self._cluster_warmup_forward(
+            label_B=cluster_label_B,
+            context_position_ids=cluster_context_position_ids,
+            context_mask=cluster_context_mask,
+            num_steps=cluster_warmup_steps,
+            cfg=cfg,
+            top_p=top_p,
+            more_smooth=more_smooth,
+            rng=rng,
+        )
+
     @torch.no_grad()
     def autoregressive_infer_cfg(
         self,
@@ -360,6 +552,9 @@ class HARTForT2I(PreTrainedModel):
         cluster_assignments: Optional[torch.LongTensor] = None,
         cluster_context_tensor: Optional[torch.Tensor] = None,
         cluster_warmup_steps: int = 0,
+        cluster_warmup_cache: Optional[Dict[str, torch.Tensor]] = None,
+        cluster_center_context_mask: Optional[torch.Tensor] = None,
+        cluster_center_context_position_ids: Optional[torch.Tensor] = None,
         save_autoregressive_steps: bool = False,
         sample_folder_dir: Optional[str] = None,
         store_seperately: bool = False,
@@ -411,40 +606,91 @@ class HARTForT2I(PreTrainedModel):
             for prompt_idx, img in enumerate(stage_imgs):
                 stage_images_per_prompt[prompt_idx].append(img)
 
-        sos = cond_BD = self.context_embed(
-            self.context_norm(
-                torch.cat((label_B, torch.full_like(label_B, fill_value=0.0)), dim=0)
-            )
+        cond_input = torch.cat(
+            (label_B, torch.full_like(label_B, fill_value=0.0)), dim=0
         )
+        cond_BD = self.context_embed(self.context_norm(cond_input))
+        sos = cond_BD
 
-        
-        
         cluster_enabled = (
             cluster_assignments is not None
             and cluster_context_tensor is not None
-            and cluster_warmup_steps > 0
+            and cluster_assignments.numel() > 0
         )
+        cluster_assignments_device: Optional[torch.Tensor] = None
+        cluster_sos: Optional[torch.Tensor] = None
+        warmup_cache_local: Optional[Dict[str, torch.Tensor]] = None
+        warmup_active = False
 
         if cluster_enabled:
-            cluster_assignments = cluster_assignments.to(
+            cluster_assignments_device = cluster_assignments.to(
                 label_B.device, dtype=torch.long
-            )
-            cluster_assignments = cluster_assignments.view(B)
+            ).view(B)
             cluster_context_tensor = cluster_context_tensor.to(
                 label_B.device, dtype=label_B.dtype
             )
-            cluster_warmup_steps = min(
-                cluster_warmup_steps, max(len(self.patch_nums) - 1, 0)
+            max_stages = max(self.num_stages_minus_1, 0)
+            cluster_warmup_steps = min(cluster_warmup_steps, max_stages)
+
+            cluster_cond_input = torch.cat(
+                (
+                    cluster_context_tensor,
+                    torch.full_like(cluster_context_tensor, fill_value=0.0),
+                ),
+                dim=0,
             )
             cluster_cond = self.context_embed(
-                self.context_norm(cluster_context_tensor)
+                self.context_norm(cluster_cond_input)
             ).to(cond_BD.dtype)
             cluster_sos = cluster_cond[:, : self.first_l, :]
-            cond_BD[B:, : self.first_l, :] = cluster_sos[cluster_assignments]
+            cond_BD[B:, : self.first_l, :] = cluster_sos[cluster_assignments_device]
             sos = cond_BD
+
+            if cluster_warmup_steps > 0:
+                if cluster_warmup_cache is None:
+                    if (
+                        cluster_center_context_mask is None
+                        or cluster_center_context_position_ids is None
+                    ):
+                        raise ValueError(
+                            "Cluster warmup requires center context mask and position ids."
+                        )
+                    warmup_cache_local = self._cluster_warmup_forward(
+                        label_B=cluster_context_tensor,
+                        context_position_ids=cluster_center_context_position_ids.to(
+                            label_B.device
+                        ),
+                        context_mask=cluster_center_context_mask.to(label_B.device),
+                        num_steps=cluster_warmup_steps,
+                        cfg=cfg,
+                        top_p=top_p,
+                        more_smooth=more_smooth,
+                        rng=rng,
+                    )
+                else:
+                    cache_steps = cluster_warmup_cache.get(
+                        "num_steps", cluster_warmup_steps
+                    )
+                    if cache_steps != cluster_warmup_steps:
+                        raise ValueError(
+                            "Provided cluster_warmup_cache mismatch in warmup steps."
+                        )
+                    cached_patch_bank = cluster_warmup_cache.get(
+                        "cluster_patch_bank", cluster_warmup_cache["f_hat"]
+                    )
+                    warmup_cache_local = {
+                        "cluster_patch_bank": cached_patch_bank.to(label_B.device),
+                        "f_hat": cluster_warmup_cache["f_hat"].to(label_B.device),
+                        "next_token_map": cluster_warmup_cache[
+                            "next_token_map"
+                        ].to(cond_BD.device),
+                        "num_steps": cache_steps,
+                    }
+                warmup_active = warmup_cache_local is not None
+                if warmup_active:
+                    cluster_warmup_steps = warmup_cache_local["num_steps"]
         else:
             cluster_warmup_steps = 0
-            cluster_cond = None
             cluster_sos = None
 
         # Haotian: need to handle CFG here so we replicate context position ids
@@ -464,36 +710,62 @@ class HARTForT2I(PreTrainedModel):
         else:
             lvl_pos = self.lvl_embed(self.lvl_1L)
 
-        if cluster_enabled:
-            base_context = cluster_sos[cluster_assignments]
-            base_context = torch.cat((base_context, cluster_sos[cluster_assignments]), dim=0)
-        else:
-            base_context = sos
-
-        if self.pos_start is not None:
-            next_token_map = (
-                base_context
-                + self.pos_start.expand_as(base_context)
-                + lvl_pos[:, : self.first_l]
-            )
-        else:
-            next_token_map = base_context + lvl_pos[:, : self.first_l]
-
+        start_stage = 0
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        if warmup_active:
+            assert warmup_cache_local is not None
+            warmup_f_hat = warmup_cache_local.get(
+                "cluster_patch_bank", warmup_cache_local["f_hat"]
+            )
+            warmup_next = warmup_cache_local["next_token_map"]
+            assert cluster_assignments_device is not None
+            f_hat = warmup_f_hat[cluster_assignments_device].clone()
+            next_token_map_prompt = warmup_next[cluster_assignments_device]
+            next_token_map = next_token_map_prompt.repeat(2, 1, 1)
+            start_stage = cluster_warmup_steps
+            cur_L = self._initial_cur_L(start_stage)
+        else:
+            if cluster_enabled and cluster_sos is not None:
+                assert cluster_assignments_device is not None
+                base_context = cluster_sos[cluster_assignments_device]
+                base_context = torch.cat(
+                    (base_context, cluster_sos[cluster_assignments_device]), dim=0
+                )
+            else:
+                base_context = sos
+
+            if self.pos_start is not None:
+                next_token_map = (
+                    base_context
+                    + self.pos_start.expand_as(base_context)
+                    + lvl_pos[:, : self.first_l]
+                )
+            else:
+                next_token_map = base_context + lvl_pos[:, : self.first_l]
+            f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+            start_stage = 0
+            cur_L = 0
+
+        stage_counter = start_stage
 
         for b in self.blocks:
             b.attn.kv_caching(True)
-        for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
+        for si in range(start_stage, len(self.patch_nums) - 1):  # si: i-th segment
+            pn = self.patch_nums[si]
             ratio = si / self.num_stages_minus_1
             if si > 0:
                 cur_L += pn * pn
             else:
                 cur_L += self.context_token
-            use_cluster_stage = cluster_enabled and si < cluster_warmup_steps
+            use_cluster_stage = (
+                cluster_enabled and (not warmup_active) and si < cluster_warmup_steps
+            )
             if use_cluster_stage:
                 stage_cond_BD = cond_BD.clone()
-                stage_cond_BD[:B, : self.first_l, :] = cluster_sos[cluster_assignments]
+                assert cluster_sos is not None and cluster_assignments_device is not None
+                stage_cond_BD[:B, : self.first_l, :] = cluster_sos[
+                    cluster_assignments_device
+                ]
             else:
                 stage_cond_BD = cond_BD
             cond_BD_or_gss = self.shared_ada_lin(stage_cond_BD)
@@ -661,7 +933,9 @@ class HARTForT2I(PreTrainedModel):
                     continue
                 stack = torch.stack(images, dim=0)
                 if stack.shape[0] < grid_cells:
-                    pad = stack[-1:].repeat(grid_cells - stack.shape[0], 1, 1, 1)
+                    pad = stack.new_zeros(
+                        (grid_cells - stack.shape[0], *stack.shape[1:])
+                    )
                     stack = torch.cat([stack, pad], dim=0)
                 elif stack.shape[0] > grid_cells:
                     stack = stack[:grid_cells]
@@ -679,10 +953,21 @@ class HARTForT2I(PreTrainedModel):
                 )
             if base_prompts:
                 prompts_path = os.path.join(intermediate_dir, "prompts.txt")
+                assignments_for_logging = (
+                    cluster_assignments_device[:B].detach().cpu().tolist()
+                    if cluster_assignments_device is not None
+                    else None
+                )
                 with open(prompts_path, "a") as f:
                     for prompt_idx, prompt in enumerate(base_prompts):
                         global_idx = prompt_offset + prompt_idx
-                        f.write(f"{global_idx:04d}: {prompt}\n")
+                        if assignments_for_logging is not None:
+                            cluster_id = assignments_for_logging[prompt_idx]
+                        else:
+                            cluster_id = -1
+                        f.write(
+                            f"{global_idx:04d}: cluster={cluster_id} | {prompt}\n"
+                        )
 
         for b in self.blocks:
             b.attn.kv_caching(False)

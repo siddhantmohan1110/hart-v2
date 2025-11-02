@@ -4,6 +4,7 @@ import datetime
 import os
 import random
 import time
+import math
 
 import numpy as np
 import torch
@@ -51,6 +52,34 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
 
     with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
         f.write("\n".join(prompts))
+
+def save_final_grids(sample_imgs: torch.Tensor, sample_folder_dir: str, grid_size: int = 4) -> None:
+    if sample_imgs.ndim != 4:
+        raise ValueError("sample_imgs must be a 4D tensor (N, C, H, W).")
+    num_imgs = sample_imgs.shape[0]
+    if num_imgs == 0:
+        return
+    grid_cells = grid_size * grid_size
+    grid_dir = os.path.join(sample_folder_dir, "final_grids")
+    os.makedirs(grid_dir, exist_ok=True)
+    for grid_idx in range(math.ceil(num_imgs / grid_cells)):
+        start = grid_idx * grid_cells
+        end = min(start + grid_cells, num_imgs)
+        chunk = sample_imgs[start:end]
+        if chunk.shape[0] < grid_cells:
+            pad = chunk.new_zeros((grid_cells - chunk.shape[0], *chunk.shape[1:]))
+            chunk = torch.cat([chunk, pad], dim=0)
+        grid = torchvision.utils.make_grid(chunk, nrow=grid_size)
+        grid_np = (
+            grid.mul(255.0)
+            .clamp_(0.0, 255.0)
+            .permute(1, 2, 0)
+            .to(torch.uint8)
+            .numpy()
+        )
+        Image.fromarray(grid_np).save(
+            os.path.join(grid_dir, f"{grid_idx:03d}_final_grid.png")
+        )
 
 
 def _pool_prompt_embeddings(context_tensor, context_mask, truncate_tokens=None):
@@ -210,6 +239,11 @@ def main(args):
             del context_tensor, context_mask, context_position_ids
             cluster_assignments = None
             cluster_context_tensor = None
+            cluster_center_mask = None
+            cluster_center_position_ids = None
+            cluster_center_indices: list[int] = []
+            pooled_embeddings = None
+            cluster_centroids = None
             cluster_method = args.cluster_method.lower()
             if cluster_method == "kmeans":
                 if (
@@ -222,12 +256,13 @@ def main(args):
                         context_mask_all,
                         truncate_tokens=args.cluster_truncate_tokens,
                     ).float()
-                    assignments, _ = _run_kmeans(
+                    assignments, centroids = _run_kmeans(
                         pooled_embeddings.detach(),
                         min(args.num_clusters, len(prompts)),
                         args.kmeans_iters,
                     )
                     cluster_assignments = assignments
+                    cluster_centroids = centroids
                 else:
                     print(
                         "Skipping k-means clustering: ensure num_clusters "
@@ -249,19 +284,42 @@ def main(args):
                 else:
                     print("Skipping HDBSCAN clustering: no prompts available.")
 
+            cluster_assignment_list: list[int] = [-1] * len(prompts)
             if cluster_assignments is not None:
                 cluster_assignments = cluster_assignments.to(dtype=torch.long)
+                cluster_assignment_list = cluster_assignments.tolist()
                 cluster_count = int(cluster_assignments.max().item()) + 1
-                cluster_contexts = []
                 for cluster_idx in range(cluster_count):
                     mask = cluster_assignments == cluster_idx
                     if mask.any():
-                        cluster_contexts.append(context_tensor_all[mask].mean(dim=0))
+                        member_indices = torch.nonzero(mask, as_tuple=False).view(-1)
+                        if pooled_embeddings is not None:
+                            member_embeddings = pooled_embeddings[member_indices]
+                            if cluster_centroids is not None:
+                                reference = cluster_centroids[cluster_idx]
+                            else:
+                                reference = member_embeddings.mean(dim=0)
+                            distances = torch.norm(
+                                member_embeddings - reference.unsqueeze(0), dim=1
+                            )
+                            best_idx = member_indices[distances.argmin()].item()
+                        else:
+                            best_idx = member_indices[0].item()
+                        cluster_center_indices.append(best_idx)
                     else:
-                        cluster_contexts.append(context_tensor_all.mean(dim=0))
-                cluster_context_tensor = torch.stack(cluster_contexts, dim=0)
+                        cluster_center_indices.append(0)
 
-                assignment_list = cluster_assignments.tolist()
+                if cluster_center_indices:
+                    center_idx_tensor = torch.tensor(
+                        cluster_center_indices, dtype=torch.long
+                    )
+                    cluster_context_tensor = context_tensor_all[center_idx_tensor]
+                    cluster_center_mask = context_mask_all[center_idx_tensor]
+                    cluster_center_position_ids = context_position_ids_all[
+                        center_idx_tensor
+                    ]
+
+                assignment_list = cluster_assignment_list
                 for cluster_idx in range(cluster_count):
                     member_prompts = [
                         prompts[p_idx]
@@ -269,12 +327,57 @@ def main(args):
                         if cluster_id == cluster_idx
                     ]
                     print(f"Cluster {cluster_idx}: {len(member_prompts)} prompts")
+                    if cluster_center_indices:
+                        center_prompt = prompts[cluster_center_indices[cluster_idx]]
+                        print(f"  Center prompt: {center_prompt}")
+
+            save_intermediate_flag = (
+                args.save_autoregressive_steps or args.save_intermediate_grids
+            )
+
+            if save_intermediate_flag and prompts:
+                intermediate_dir = os.path.join(
+                    args.sample_folder_dir, "autoregressive_steps"
+                )
+                os.makedirs(intermediate_dir, exist_ok=True)
+                cluster_log_path = os.path.join(
+                    intermediate_dir, "prompt_clusters.txt"
+                )
+                with open(cluster_log_path, "w") as f:
+                    for idx, prompt in enumerate(prompts):
+                        cluster_id = cluster_assignment_list[idx]
+                        f.write(f"{idx:04d}\tcluster={cluster_id}\t{prompt}\n")
 
             infer_func = (
                 ema_model.autoregressive_infer_cfg
                 if args.use_ema
                 else model.autoregressive_infer_cfg
             )
+
+            infer_model = ema_model if args.use_ema else model
+            cluster_warmup_cache = None
+            if (
+                cluster_assignments is not None
+                and cluster_context_tensor is not None
+                and cluster_center_mask is not None
+                and cluster_center_position_ids is not None
+                and args.cluster_warmup_steps > 0
+            ):
+                print(
+                    f"Preparing cluster warmup cache for "
+                    f"{len(cluster_center_indices)} cluster centers "
+                    f"over {args.cluster_warmup_steps} autoregressive steps."
+                )
+                cluster_warmup_cache = infer_model.prepare_cluster_warmup_cache(
+                    cluster_context_tensor.to(device),
+                    cluster_center_position_ids.to(device),
+                    cluster_center_mask.to(device),
+                    args.cluster_warmup_steps,
+                    cfg=args.cfg,
+                    top_p=0.0,
+                    more_smooth=args.more_smooth,
+                    g_seed=args.seed,
+                )
             outputs = []
             for start, end in _batched_indices(
                 len(prompts), args.prompts_per_batch
@@ -295,12 +398,15 @@ def main(args):
                     cluster_assignments=cluster_assignments_chunk,
                     cluster_context_tensor=cluster_context_tensor,
                     cluster_warmup_steps=args.cluster_warmup_steps,
+                    cluster_warmup_cache=cluster_warmup_cache,
+                    cluster_center_context_mask=cluster_center_mask,
+                    cluster_center_context_position_ids=cluster_center_position_ids,
                     cfg=args.cfg,
                     g_seed=args.seed,
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids_chunk,
                     context_mask=context_mask_chunk,
-                    save_autoregressive_steps=args.save_autoregressive_steps,
+                    save_autoregressive_steps=save_intermediate_flag,
                     sample_folder_dir=args.sample_folder_dir,
                     store_seperately=args.store_seperately,
                     prompts=prompts[start:end],
@@ -308,14 +414,16 @@ def main(args):
                 )
                 inference_time += time.time() - chunk_start
                 outputs.append(output_chunk.detach().cpu())
-            output_imgs = torch.cat(outputs, dim=0)
-            
+            output_imgs = torch.cat(outputs, dim=0).clamp_(0.0, 1.0)
 
     total_time = time.time() - start_time
     print(
         f"Generate {len(prompts)} images in {total_time:2f}s "
         f"(batched inference {inference_time:2f}s)."
     )
+
+    if args.save_final_grids:
+        save_final_grids(output_imgs.clone(), args.sample_folder_dir)
 
     save_images(
         output_imgs.clone(), args.sample_folder_dir, args.store_seperately, prompts
@@ -365,7 +473,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--cluster_warmup_steps",
         type=int,
-        default=5,
+        default=2,
         help="Number of low-resolution stages to guide via cluster centers.",
     )
     parser.add_argument(
@@ -425,6 +533,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--save_autoregressive_steps",
         help="Enable saving intermediate autoregressive stage images.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--save_intermediate_grids",
+        help="Save 4x4 grids of intermediate autoregressive steps for each prompt.",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--save_final_grids",
+        help="Save final images in batched 4x4 grids with empty padding.",
         action="store_true",
     )
     args = parser.parse_args()
