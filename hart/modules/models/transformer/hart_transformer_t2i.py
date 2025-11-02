@@ -203,7 +203,7 @@ class HARTForT2I(PreTrainedModel):
         #     dtype=torch.float32,
         #     device=get_device(),
         # )
-        self.context_token = context_token
+        self.context_token_len = context_token
         self.context_dim = context_dim
         self.context_shape = (context_token, context_dim)
         self.context_embed = nn.Linear(context_dim, self.D)
@@ -213,7 +213,7 @@ class HARTForT2I(PreTrainedModel):
             self.context_norm = nn.Identity()
 
         nn.init.trunc_normal_(self.context_embed.weight.data, mean=0, std=init_std)
-        if attn_type == "gpt2" or self.context_token == 0:
+        if attn_type == "gpt2" or self.context_token_len == 0:
             # gpt2 uses absolute pos emb for context tokens
             # c2i also adds this absolute pos emb
             self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
@@ -276,7 +276,7 @@ class HARTForT2I(PreTrainedModel):
                     max_position_embeddings=2
                     ** int(math.ceil(math.log2(self.L + context_token - 1))),
                     patch_nums=self.patch_nums,
-                    context_token=self.context_token,
+                    context_token=self.context_token_len,
                     disable_aln=self.disable_aln,
                     sep_aln_pooling_mode=self.sep_aln_pooling_mode,
                     use_cross_attn=self.use_cross_attn,
@@ -399,7 +399,7 @@ class HARTForT2I(PreTrainedModel):
             self.rng.manual_seed(g_seed)
             rng = self.rng
         assert label_B is not None
-        assert label_B.shape[1] == self.context_token
+        assert label_B.shape[1] == self.context_token_len
 
         record_intermediate = (
             save_autoregressive_steps and sample_folder_dir is not None
@@ -511,7 +511,7 @@ class HARTForT2I(PreTrainedModel):
                 # Calculate cur_L for the stages we're skipping
                 for si in range(cluster_stage_N + 1):
                     if si == 0:
-                        cur_L += self.context_token
+                        cur_L += self.context_token_len
                     else:
                         cur_L += self.patch_nums[si] * self.patch_nums[si]
                 
@@ -544,9 +544,9 @@ class HARTForT2I(PreTrainedModel):
             if start_stage == 0:
                 # Normal path: update cur_L for each stage
                 if si > 0:
-                    cur_L += pn * pn
+                    cur_L += pn * pn #current length
                 else:
-                    cur_L += self.context_token
+                    cur_L += self.context_token_len #start_length=300
             elif si >= start_stage:
                 # We're continuing from a later stage, cur_L was set in setup
                 # Just need to ensure we don't double-count
@@ -769,7 +769,7 @@ class HARTForT2I(PreTrainedModel):
         mask = torch.zeros(bsz, seq_len, device=x.device)
         # all first few stages are kept
         mask_keep = torch.zeros(
-            bsz, self.L - seq_len + self.context_token - 1, device=x.device
+            bsz, self.L - seq_len + self.context_token_len - 1, device=x.device
         )
         mask = torch.scatter(
             mask,
@@ -797,14 +797,14 @@ class HARTForT2I(PreTrainedModel):
         bg, ed = (
             self.begin_ends[self.prog_si]
             if self.prog_si >= 0
-            else (0, self.L + self.context_token - 1)
+            else (0, self.L + self.context_token_len - 1)
         )
         B = x_BLCv_wo_first_l.shape[0]
         orders = self.sample_orders(bsz=B)
         mask, mask_wo_prev_stages = self.random_masking(
             x_BLCv_wo_first_l[:, -self.last_level_pns :, :], orders
         )
-        mask_for_attn = (1 - mask)[:, self.context_token :].nonzero(as_tuple=True)
+        mask_for_attn = (1 - mask)[:, self.context_token_len :].nonzero(as_tuple=True)
         mask = (1 - mask).nonzero(as_tuple=True)
         mask_wo_prev_stages = (1 - mask_wo_prev_stages).nonzero(as_tuple=True)
         last_layer_gt = last_layer_gt[mask_wo_prev_stages].reshape(
@@ -816,7 +816,7 @@ class HARTForT2I(PreTrainedModel):
         ed = (
             last_layer_gt.shape[1]
             + self.L
-            + self.context_token
+            + self.context_token_len
             - 1
             - self.last_level_pns
         )
@@ -888,7 +888,7 @@ class HARTForT2I(PreTrainedModel):
         # parallel generation of discrete and continuous tokens
         x_BLC_logits, last_layer_cond = (
             x_BLC,
-            x_BLC[:, self.L + self.context_token - 1 - self.last_level_pns :, :],
+            x_BLC[:, self.L + self.context_token_len - 1 - self.last_level_pns :, :],
         )
 
         x_BLC_logits = self.get_logits(x_BLC_logits.float(), cond_BD)
@@ -899,7 +899,7 @@ class HARTForT2I(PreTrainedModel):
             try:
                 idx_BL_sampled = sample_with_top_k_top_p_(
                     x_BLC_logits[
-                        :, self.L + self.context_token - 1 - self.last_level_pns :
+                        :, self.L + self.context_token_len - 1 - self.last_level_pns :
                     ]
                     .clone()
                     .detach(),
@@ -920,7 +920,7 @@ class HARTForT2I(PreTrainedModel):
         )
         # Haotian: important, we should start from self.context_token - 1.
         return (
-            x_BLC_logits[:, self.context_token - 1 :, :],
+            x_BLC_logits[:, self.context_token_len - 1 :, :],
             diff_loss,
             mask_wo_prev_stages,
         )  # logits BLV, V is vocab_size
