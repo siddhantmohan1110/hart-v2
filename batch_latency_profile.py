@@ -12,8 +12,8 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 from transformers import AutoModel, AutoTokenizer, set_seed
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
+# from sklearn.cluster import KMeans
+# from sklearn.metrics.pairwise import cosine_similarity
 
 from hart.utils import encode_prompts, llm_system_prompt
 from hart.modules.models.transformer import HARTForT2I
@@ -303,7 +303,7 @@ def load_cluster_centroids(
 def _generate_centroids_mode(args: argparse.Namespace, device: torch.device) -> None:
     """Generate cluster centroids from the dataset."""
     # Load models
-    model = AutoModel.from_pretrained(args.model_path).to(device)
+    model = AutoModel.from_pretrained(args.model_path, torch_dtype=torch.float16).to(device)
     model.eval()
     
     if args.use_ema:
@@ -320,8 +320,7 @@ def _generate_centroids_mode(args: argparse.Namespace, device: torch.device) -> 
     
     # Load dataset
     try:
-        dataset = json.load
-        # dataset = load_dataset(args.dataset_name, split=args.dataset_split)
+        dataset = load_dataset(args.dataset_name, split=args.dataset_split)
     except ValueError as err:
         if "Unknown split" not in str(err):
             raise
@@ -337,7 +336,7 @@ def _generate_centroids_mode(args: argparse.Namespace, device: torch.device) -> 
     prompts = [str(item[prompt_column]) for item in dataset]
     
     # Generate centroids
-    output_path = args.centroid_output_path or f"cluster_centroids_stage{args.centroid_stage_N}.pkl"
+    output_path = args.centroid_output_path or f"./cluster_centroids/cluster_centroids_stage_{args.centroid_stage_N}.pkl"
     
     generate_cluster_centroids(
         model=model,
@@ -550,13 +549,13 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="pretrained_models/HART-1024",
+        default="./hart-0.7b-1024px/llm",
     )
     parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct",
+        default="./Qwen2-VL-1.5B-Instruct",
     )
     parser.add_argument(
         "--batch_size", type=int, help="Generation batch size", default=1
@@ -632,7 +631,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--centroid_output_path",
         type=str,
-        default=None,
+        default="./cluster_centroids/cluster_centroids_stage_{args.centroid_stage_N}.pkl",
         help="Path to save cluster centroids.",
     )
     parser.add_argument(
