@@ -393,10 +393,11 @@ class HARTForT2I(PreTrainedModel):
                 cur_L += self.context_token
 
             if is_shared_hart:
-                if si < alpha:
+                if si <= alpha:
                     continue
-                elif si == alpha:
-                    f_hat = torch.load(os.path.join(shared_hart_path, f'fhat_stage_{si}.pt'))
+                elif si == alpha+1:
+                    cur_L_old = cur_L - pn * pn
+                    f_hat = torch.load(os.path.join(shared_hart_path, f'fhat_stage_{si-1}.pt'))
                     print(f"Loaded f_hat from {shared_hart_path} at stage {si}...")
                     next_token_map = F.interpolate(
                         f_hat,
@@ -405,8 +406,10 @@ class HARTForT2I(PreTrainedModel):
                     )
                     next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                     next_token_map = (self.word_embed(next_token_map)
-                        + lvl_pos[:, cur_L : cur_L + self.patch_nums[si] ** 2])
+                        + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
                     next_token_map = next_token_map.repeat(2, 1, 1)
+
+                    torch.save(next_token_map, os.path.join(save_fhat_path, f'next_token_map_new_{si}.pt'))
 
             print(f"Continue to forward... at stage {si}...")
 
@@ -466,6 +469,7 @@ class HARTForT2I(PreTrainedModel):
             if save_fhat and si == alpha:
                 os.makedirs(save_fhat_path, exist_ok=True)
                 torch.save(f_hat, os.path.join(save_fhat_path, f'fhat_stage_{si}.pt'))
+                torch.save(next_token_map, os.path.join(save_fhat_path, f'next_token_map_{si+1}.pt'))
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
