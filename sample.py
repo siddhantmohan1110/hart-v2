@@ -125,7 +125,8 @@ def main(args):
                 more_smooth=args.more_smooth,
                 context_position_ids=context_position_ids,
                 context_mask=context_mask,
-                is_shared_hart=True
+                # save_fhat=True,
+                is_shared_hart=True,
             )
 
     total_time = time.time() - start_time

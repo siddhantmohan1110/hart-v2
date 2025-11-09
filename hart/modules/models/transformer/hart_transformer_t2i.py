@@ -396,23 +396,25 @@ class HARTForT2I(PreTrainedModel):
                 if si <= alpha:
                     continue
                 elif si == alpha+1:
-                    cur_L_old = cur_L - pn * pn
-                    f_hat = torch.load(os.path.join(shared_hart_path, f'fhat_stage_{si-1}.pt'))
-                    print(f"Loaded f_hat from {shared_hart_path} at stage {si}...")
+                    state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device())
+                    f_hat = state["f_hat"].to(get_device())
+                    for blk, layer_state in zip(self.blocks, state["layers"]):
+                        blk.attn.caching = True
+                        blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
+                        blk.attn.cached_v = layer_state["v"].to(f_hat.dtype).to(get_device())
+                    print(f"Loaded f_hat and KV cache from {shared_hart_path} at stage {si}...")
                     next_token_map = F.interpolate(
                         f_hat,
                         size=(self.patch_nums[si], self.patch_nums[si]),
                         mode="area",
                     )
+                    cur_L_old = cur_L - pn * pn
                     next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                     next_token_map = (self.word_embed(next_token_map)
                         + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
                     next_token_map = next_token_map.repeat(2, 1, 1)
 
-                    torch.save(next_token_map, os.path.join(save_fhat_path, f'next_token_map_new_{si}.pt'))
-
-            print(f"Continue to forward... at stage {si}...")
-
+            print(f"Continue to forward... at stage {si}...")     
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
@@ -468,8 +470,11 @@ class HARTForT2I(PreTrainedModel):
             )  # double the batch sizes due to CFG
             if save_fhat and si == alpha:
                 os.makedirs(save_fhat_path, exist_ok=True)
-                torch.save(f_hat, os.path.join(save_fhat_path, f'fhat_stage_{si}.pt'))
-                torch.save(next_token_map, os.path.join(save_fhat_path, f'next_token_map_{si+1}.pt'))
+                share_state = {
+                    "f_hat": f_hat.detach().cpu(),
+                    "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
+                    }
+                torch.save(share_state, os.path.join(save_fhat_path, f'fhat_kv_stage_{si}.pt'))
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
