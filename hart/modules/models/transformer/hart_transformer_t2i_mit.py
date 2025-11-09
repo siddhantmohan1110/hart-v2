@@ -5,7 +5,6 @@ This file is adopted and modified from https://github.com/FoundationVision/VAR/b
 
 import math
 import os
-import time
 from functools import partial
 from typing import Optional, Tuple, Union
 
@@ -13,7 +12,6 @@ import numpy as np
 import scipy.stats as stats
 import torch
 import torch.nn as nn
-from torch.nn import functional as F
 from huggingface_hub import PyTorchModelHubMixin
 from transformers import AutoConfig, AutoModel, PreTrainedModel
 
@@ -314,11 +312,6 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
-        alpha: int = 1,
-        save_fhat: bool = False,
-        save_fhat_path: str = './fhat_images',
-        is_shared_hart: bool = False,
-        shared_hart_path: str = './fhat_images',
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -379,37 +372,15 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(True)
-
-                    # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
-
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             if si > 0:
                 cur_L += pn * pn
             else:
                 cur_L += self.context_token
-
-            if is_shared_hart:
-                if si < alpha:
-                    continue
-                elif si == alpha:
-                    f_hat = torch.load(os.path.join(shared_hart_path, f'fhat_stage_{si}.pt'))
-                    print(f"Loaded f_hat from {shared_hart_path} at stage {si}...")
-                    next_token_map = F.interpolate(
-                        f_hat,
-                        size=(self.patch_nums[si], self.patch_nums[si]),
-                        mode="area",
-                    )
-                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                    next_token_map = (self.word_embed(next_token_map)
-                        + lvl_pos[:, cur_L : cur_L + self.patch_nums[si] ** 2])
-                    next_token_map = next_token_map.repeat(2, 1, 1)
-
-            print(f"Continue to forward... at stage {si}...")
-
+            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
+            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
@@ -463,9 +434,6 @@ class HARTForT2I(PreTrainedModel):
             next_token_map = next_token_map.repeat(
                 2, 1, 1
             )  # double the batch sizes due to CFG
-            if save_fhat and si == alpha:
-                os.makedirs(save_fhat_path, exist_ok=True)
-                torch.save(f_hat, os.path.join(save_fhat_path, f'fhat_stage_{si}.pt'))
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1

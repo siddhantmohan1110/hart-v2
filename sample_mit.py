@@ -29,7 +29,7 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
 
         os.makedirs(sample_folder_dir, exist_ok=True)
         grid_np = Image.fromarray(grid_np.astype(np.uint8))
-        grid_np.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_sample_images.png"))
+        grid_np.save(os.path.join(sample_folder_dir, f"sample_images.png"))
         print(f"Example images are saved to {sample_folder_dir}")
     else:
         # bs, 3, r, r
@@ -40,7 +40,7 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
             cur_img = sample_imgs_np[img_idx]
             cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
             cur_img_store = Image.fromarray(cur_img)
-            cur_img_store.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_{img_idx:06d}.png"))
+            cur_img_store.save(os.path.join(sample_folder_dir, f"{img_idx:06d}.png"))
             print(f"Image {img_idx} saved.")
 
     with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
@@ -65,12 +65,12 @@ def main(args):
     text_model.eval()
     text_tokenizer_max_length = args.max_token_length
 
-    # safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
-    # safety_checker_model = AutoModelForCausalLM.from_pretrained(
-    #     args.shield_model_path,
-    #     device_map="auto",
-    #     torch_dtype=torch.bfloat16,
-    # ).to(device)
+    safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
+    safety_checker_model = AutoModelForCausalLM.from_pretrained(
+        args.shield_model_path,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    ).to(device)
 
     prompts = []
     if args.prompt:
@@ -83,14 +83,14 @@ def main(args):
         )
         prompts = random.sample(default_prompts, 4)
 
-    # for idx, prompt in enumerate(prompts):
-    #     if safety_check.is_dangerous(
-    #         safety_checker_tokenizer, safety_checker_model, prompt
-    #     ):
-    #         prompts[idx] = random.sample(default_prompts, 1)[0]
-    #         print(
-    #             f"Detected Unsafe prompt with index {idx}, will replace by one of default prompts."
-    #         )
+    for idx, prompt in enumerate(prompts):
+        if safety_check.is_dangerous(
+            safety_checker_tokenizer, safety_checker_model, prompt
+        ):
+            prompts[idx] = random.sample(default_prompts, 1)[0]
+            print(
+                f"Detected Unsafe prompt with index {idx}, will replace by one of default prompts."
+            )
 
     start_time = time.time()
     with torch.inference_mode():
@@ -125,7 +125,6 @@ def main(args):
                 more_smooth=args.more_smooth,
                 context_position_ids=context_position_ids,
                 context_mask=context_mask,
-                is_shared_hart=True
             )
 
     total_time = time.time() - start_time
@@ -142,7 +141,7 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="hart-0.7b-1024px/llm",
+        default="pretrained_models/HART-1024",
     )
     parser.add_argument(
         "--text_model_path",
