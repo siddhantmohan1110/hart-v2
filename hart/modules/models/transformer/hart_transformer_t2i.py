@@ -314,7 +314,7 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
-        alpha: int = 1,
+        alpha: int = 3,
         save_fhat: bool = False,
         save_fhat_path: str = './fhat_images',
         is_shared_hart: bool = False,
@@ -395,24 +395,83 @@ class HARTForT2I(PreTrainedModel):
             if is_shared_hart:
                 if si <= alpha:
                     continue
-                elif si == alpha+1:
-                    state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device())
-                    f_hat = state["f_hat"].to(get_device())
+                elif si == alpha+1: # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
+                    state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
+                    f_hat = state["f_hat"].to(get_device()) 
                     for blk, layer_state in zip(self.blocks, state["layers"]):
                         blk.attn.caching = True
                         blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
                         blk.attn.cached_v = layer_state["v"].to(f_hat.dtype).to(get_device())
                     print(f"Loaded f_hat and KV cache from {shared_hart_path} at stage {si}...")
-                    next_token_map = F.interpolate(
-                        f_hat,
-                        size=(self.patch_nums[si], self.patch_nums[si]),
-                        mode="area",
+                    x = next_token_map
+                    AdaLNSelfAttn.forward
+                    for b in self.blocks:
+                        # Haotian: si used for position embed
+                        x = b(
+                            x=x,
+                            cond_BD=cond_BD_or_gss,
+                            attn_bias=None,
+                            si=0,
+                            context_position_ids=context_position_ids,
+                            context_mask=context_mask,
+                        )
+
+                    logits_BlV = self.get_logits(x, cond_BD)
+                    if si == self.num_stages_minus_1:
+                        last_layer_cond = x
+
+                    t = cfg * ratio
+                    logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                    # Haotian: Added for text-conditioned generation
+                    # if si == 0:
+                    #     logits_BlV = logits_BlV[:, [-1], :]
+                    logits_BlV = logits_BlV[:, [-1], :]# Since we are again starting form si=0
+                    idx_Bl = sample_with_top_k_top_p_(
+                        logits_BlV,
+                        rng=rng,
+                        top_k=(600 if si < 7 else 300),
+                        top_p=top_p,
+                        num_samples=1,
+                    )[:, :, 0]
+                    if not more_smooth:  # this is the default case
+                        h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
+                    else:  # not used when evaluating FID/IS/Precision/Recall
+                        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
+                        h_BChw = gumbel_softmax_with_rng(
+                            logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+                        ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                    print('h_BCW.shape()',h_BChw.shape)
+                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, 1, 1)
+                    print('h_BCW.shape after transpose',h_BChw.shape)
+
+                    f_hat, next_token_map = self.vae_quant_proxy[
+                        0
+                    ].get_next_autoregressive_input(
+                        si-1, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
                     )
+
                     cur_L_old = cur_L - pn * pn
                     next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
                     next_token_map = (self.word_embed(next_token_map)
                         + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
                     next_token_map = next_token_map.repeat(2, 1, 1)
+
+
+
+
+
+
+
+                    # next_token_map = F.interpolate(
+                    #     f_hat,
+                    #     size=(self.patch_nums[si], self.patch_nums[si]),
+                    #     mode="area",
+                    # )
+                    # cur_L_old = cur_L - pn * pn
+                    # next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                    # next_token_map = (self.word_embed(next_token_map)
+                    #     + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
+                    # next_token_map = next_token_map.repeat(2, 1, 1)
 
             print(f"Continue to forward... at stage {si}...")     
             x = next_token_map
