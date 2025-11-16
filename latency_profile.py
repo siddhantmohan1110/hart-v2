@@ -128,6 +128,7 @@ def main(args):
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
+                    is_shared_hart=True,
                 )
             total_time = time.time() - start_time
 
@@ -143,7 +144,7 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="pretrained_models/HART-1024",
+        default="hart-0.7b-1024px/llm",
     )
     parser.add_argument(
         "--text_model_path",

@@ -398,11 +398,11 @@ class HARTForT2I(PreTrainedModel):
                 elif si == alpha+1: # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
                     state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
                     f_hat = state["f_hat"].to(get_device()) 
-                    for blk, layer_state in zip(self.blocks, state["layers"]):
-                        blk.attn.caching = True
-                        blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
-                        blk.attn.cached_v = layer_state["v"].to(f_hat.dtype).to(get_device())
-                    print(f"Loaded f_hat and KV cache from {shared_hart_path} at stage {si}...")
+                    # for blk, layer_state in zip(self.blocks, state["layers"]):
+                    #     blk.attn.caching = True
+                    #     blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
+                    #     blk.attn.cached_v = layer_state["v"].to(f_hat.dtype).to(get_device())
+                    # print(f"Loaded f_hat and KV cache from {shared_hart_path} at stage {si}...")
                     x = next_token_map
                     AdaLNSelfAttn.forward
                     for b in self.blocks:
@@ -440,9 +440,9 @@ class HARTForT2I(PreTrainedModel):
                         h_BChw = gumbel_softmax_with_rng(
                             logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
                         ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-                    print('h_BCW.shape()',h_BChw.shape)
+                    # print('h_BCW.shape()',h_BChw.shape)
                     h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, 1, 1)
-                    print('h_BCW.shape after transpose',h_BChw.shape)
+                    # print('h_BCW.shape after transpose',h_BChw.shape)
 
                     f_hat, next_token_map = self.vae_quant_proxy[
                         0
@@ -457,11 +457,6 @@ class HARTForT2I(PreTrainedModel):
                     next_token_map = next_token_map.repeat(2, 1, 1)
 
 
-
-
-
-
-
                     # next_token_map = F.interpolate(
                     #     f_hat,
                     #     size=(self.patch_nums[si], self.patch_nums[si]),
@@ -473,7 +468,7 @@ class HARTForT2I(PreTrainedModel):
                     #     + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
                     # next_token_map = next_token_map.repeat(2, 1, 1)
 
-            print(f"Continue to forward... at stage {si}...")     
+            # print(f"Continue to forward... at stage {si}...")     
             x = next_token_map
             AdaLNSelfAttn.forward
             for b in self.blocks:
