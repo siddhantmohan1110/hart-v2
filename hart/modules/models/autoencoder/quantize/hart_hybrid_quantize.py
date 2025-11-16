@@ -190,7 +190,8 @@ class HARTHybridQuantizer(VARQuantizer):
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:  # only used in VAR inference
         if patch_nums is None:
             patch_nums = self.v_patch_nums
-        HW = patch_nums[-1]
+        #HW = patch_nums[-1]
+        HW = 64
         if si != SN - 1:
             h = self.quant_resi[si / (SN - 1)](
                 F.interpolate(h_BChw, size=(HW, HW), mode="bicubic")

@@ -20,6 +20,7 @@ from transformers import (
 
 from hart.modules.models.transformer import HARTForT2I
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt
+from hart.utils import get_device
 
 
 def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
@@ -102,11 +103,14 @@ def main(args):
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
+                    is_shared_hart=False,
                 )
-
+            #state = torch.load(os.path.join('./fhat_images', f'fhat_kv_stage_3.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
             # latency profile
             start_time = time.time()
+            step_time=[0,0,0,0,0,0,0,0,0,0,0,0,0]  # For 13 stages
             for _ in tqdm(range(args.profile_iter)):
+                
                 (
                     context_tokens,
                     context_mask,
@@ -129,6 +133,9 @@ def main(args):
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
                     is_shared_hart=True,
+                    step_time=step_time,
+                    # state=state
+
                 )
             total_time = time.time() - start_time
 
@@ -136,6 +143,7 @@ def main(args):
     print(
         f"Generation with batch_size = {args.batch_size} take {average_time:2f}s per step."
     )
+    print(f"step_time profile: {[t/args.profile_iter for t in step_time]}")
 
 
 if __name__ == "__main__":
@@ -173,3 +181,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     main(args)
+

@@ -126,7 +126,7 @@ def main(args):
                 context_position_ids=context_position_ids,
                 context_mask=context_mask,
                 save_fhat=False,
-                is_shared_hart=False,
+                is_shared_hart=True,
             )
 
     total_time = time.time() - start_time

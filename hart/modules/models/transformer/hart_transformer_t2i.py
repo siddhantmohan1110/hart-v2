@@ -61,6 +61,49 @@ class SharedAdaLin(nn.Linear):
         return super().forward(cond_BD).view(-1, 1, 6, C)  # B16C
 
 
+import random
+
+def sample_prefix_with_endpoints(arr, n, mid_idx, zeta=0):
+    if zeta == 1:
+        return [arr[0]]
+
+    if not (1 <= mid_idx < len(arr)):
+        raise ValueError("mid_idx must be at least 1 and within range")
+    if n < 2 or n > mid_idx + 1:
+        raise ValueError("n must be between 2 and mid_idx+1")
+
+    needed = n - 2
+    interior = list(range(1, mid_idx))
+    picks = sorted(random.sample(interior, needed)) if needed else []
+    indices = [0] + picks + [mid_idx]
+    return [arr[i] for i in indices]
+
+
+import bisect
+
+def find_index(arr, x):
+    """
+    Return the index of x in sorted list arr, or -1 if not found.
+    """
+    idx = bisect.bisect_left(arr, x)
+    if idx != len(arr) and arr[idx] == x:
+        return idx
+    return -1
+
+
+def build_lvl_slices(patch_nums, context_len=300):
+    slices = []
+    pos = context_len
+    for pn in patch_nums:
+        start, end = pos, pos + pn * pn
+        slices.append((start, end))
+        pos = end
+    return slices  # index-aligned with patch_nums
+
+
+
+
+
 class HARTForT2I(PreTrainedModel):
     config_class = HARTForT2IConfig
 
@@ -314,11 +357,14 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
-        alpha: int = 3,
+        alpha: int = 4,
         save_fhat: bool = False,
         save_fhat_path: str = './fhat_images',
         is_shared_hart: bool = False,
         shared_hart_path: str = './fhat_images',
+        step_time: Optional[list] = None, 
+        state:torch.Tensor=None,
+        zeta: int = 2,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -382,9 +428,11 @@ class HARTForT2I(PreTrainedModel):
 
                     # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-
+        state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_4.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
+                   
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
-
+            
+            start_time = time.time()
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             if si > 0:
@@ -396,65 +444,74 @@ class HARTForT2I(PreTrainedModel):
                 if si <= alpha:
                     continue
                 elif si == alpha+1: # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
-                    state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
+                    #state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
                     f_hat = state["f_hat"].to(get_device()) 
                     # for blk, layer_state in zip(self.blocks, state["layers"]):
                     #     blk.attn.caching = True
                     #     blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
                     #     blk.attn.cached_v = layer_state["v"].to(f_hat.dtype).to(get_device())
                     # print(f"Loaded f_hat and KV cache from {shared_hart_path} at stage {si}...")
-                    x = next_token_map
-                    AdaLNSelfAttn.forward
-                    for b in self.blocks:
-                        # Haotian: si used for position embed
-                        x = b(
-                            x=x,
-                            cond_BD=cond_BD_or_gss,
-                            attn_bias=None,
-                            si=0,
-                            context_position_ids=context_position_ids,
-                            context_mask=context_mask,
+                    pn_shortcut = sample_prefix_with_endpoints(self.patch_nums, zeta, alpha)
+                    # once at setup
+                    lvl_slices = build_lvl_slices(self.patch_nums)
+
+                    
+                    for j in range(zeta):
+                        x = next_token_map
+                        import pdb
+                        pdb.set_trace()
+                        AdaLNSelfAttn.forward
+                        for b in self.blocks:
+                            # Haotian: si used for position embed
+                            x = b(
+                                x=x,
+                                cond_BD=cond_BD_or_gss,
+                                attn_bias=None,
+                                si=j,
+                                context_position_ids=context_position_ids,
+                                context_mask=context_mask,
+                            )
+
+                        logits_BlV = self.get_logits(x, cond_BD)
+                        if si == self.num_stages_minus_1:
+                            last_layer_cond = x
+
+                        t = cfg * ratio
+                        logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
+                        # Haotian: Added for text-conditioned generation
+                        if j == 0:
+                             logits_BlV = logits_BlV[:, [-1], :]
+                        idx_Bl = sample_with_top_k_top_p_(
+                            logits_BlV,
+                            rng=rng,
+                            top_k=(600 if si+j < 7 else 300),
+                            top_p=top_p,
+                            num_samples=1,
+                        )[:, :, 0]
+                        if not more_smooth:  # this is the default case
+                            h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
+                        else:  # not used when evaluating FID/IS/Precision/Recall
+                            gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
+                            h_BChw = gumbel_softmax_with_rng(
+                                logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
+                            ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
+                        # print('h_BCW.shape()',h_BChw.shape)
+                        h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn_shortcut[j], pn_shortcut[j])
+                        # print('h_BCW.shape after transpose',h_BChw.shape)
+
+                        f_hat, next_token_map = self.vae_quant_proxy[
+                            0
+                        ].get_next_autoregressive_input(
+                            find_index(self.patch_nums, pn_shortcut[j])-1, zeta, f_hat, h_BChw, patch_nums=pn_shortcut
                         )
 
-                    logits_BlV = self.get_logits(x, cond_BD)
-                    if si == self.num_stages_minus_1:
-                        last_layer_cond = x
-
-                    t = cfg * ratio
-                    logits_BlV = (1 + t) * logits_BlV[:B] - t * logits_BlV[B:]
-                    # Haotian: Added for text-conditioned generation
-                    # if si == 0:
-                    #     logits_BlV = logits_BlV[:, [-1], :]
-                    logits_BlV = logits_BlV[:, [-1], :]# Since we are again starting form si=0
-                    idx_Bl = sample_with_top_k_top_p_(
-                        logits_BlV,
-                        rng=rng,
-                        top_k=(600 if si < 7 else 300),
-                        top_p=top_p,
-                        num_samples=1,
-                    )[:, :, 0]
-                    if not more_smooth:  # this is the default case
-                        h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
-                    else:  # not used when evaluating FID/IS/Precision/Recall
-                        gum_t = max(0.27 * (1 - ratio * 0.95), 0.005)  # refer to mask-git
-                        h_BChw = gumbel_softmax_with_rng(
-                            logits_BlV.mul(1 + ratio), tau=gum_t, hard=False, dim=-1, rng=rng
-                        ) @ self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
-                    # print('h_BCW.shape()',h_BChw.shape)
-                    h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, 1, 1)
-                    # print('h_BCW.shape after transpose',h_BChw.shape)
-
-                    f_hat, next_token_map = self.vae_quant_proxy[
-                        0
-                    ].get_next_autoregressive_input(
-                        si-1, len(self.patch_nums), f_hat, h_BChw, patch_nums=self.patch_nums
-                    )
-
-                    cur_L_old = cur_L - pn * pn
-                    next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                    next_token_map = (self.word_embed(next_token_map)
-                        + lvl_pos[:, cur_L_old : cur_L_old + self.patch_nums[si] ** 2])
-                    next_token_map = next_token_map.repeat(2, 1, 1)
+                        # inside your loop
+                        start, end = lvl_slices[si + j]
+                        pos_slice = lvl_pos[:, start:end]
+                        next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
+                        next_token_map = (self.word_embed(next_token_map)
+                            + pos_slice)
+                        next_token_map = next_token_map.repeat(2, 1, 1)
 
 
                     # next_token_map = F.interpolate(
@@ -529,6 +586,9 @@ class HARTForT2I(PreTrainedModel):
                     "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
                     }
                 torch.save(share_state, os.path.join(save_fhat_path, f'fhat_kv_stage_{si}.pt'))
+            total_time = time.time()-start_time
+            if step_time is not None:
+                step_time[si]+= total_time
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
