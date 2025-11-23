@@ -7,7 +7,7 @@ import math
 import os
 import time
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import scipy.stats as stats
@@ -318,7 +318,7 @@ class HARTForT2I(PreTrainedModel):
         save_fhat: bool = False,
         save_fhat_path: str = './fhat_images',
         is_shared_hart: bool = False,
-        shared_hart_path: str = './fhat_images',
+        shared_state: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -376,6 +376,13 @@ class HARTForT2I(PreTrainedModel):
 
         cur_L = 0
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        cached_shared_state = shared_state
+        if cached_shared_state is not None:
+            f_hat = cached_shared_state["f_hat"].to(get_device())
+        elif is_shared_hart:
+            raise ValueError(
+                "shared_state must be provided when is_shared_hart is True."
+            )
 
         for b in self.blocks:
             b.attn.kv_caching(True)
@@ -396,8 +403,8 @@ class HARTForT2I(PreTrainedModel):
                 if si <= alpha:
                     continue
                 elif si == alpha+1: # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
-                    state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
-                    f_hat = state["f_hat"].to(get_device()) 
+                    # state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
+                    # f_hat = state["f_hat"].to(get_device()) 
                     # for blk, layer_state in zip(self.blocks, state["layers"]):
                     #     blk.attn.caching = True
                     #     blk.attn.cached_k = layer_state["k"].to(f_hat.dtype).to(get_device())
@@ -526,7 +533,7 @@ class HARTForT2I(PreTrainedModel):
                 os.makedirs(save_fhat_path, exist_ok=True)
                 share_state = {
                     "f_hat": f_hat.detach().cpu(),
-                    "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
+                    # "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
                     }
                 torch.save(share_state, os.path.join(save_fhat_path, f'fhat_kv_stage_{si}.pt'))
 

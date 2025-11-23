@@ -21,6 +21,11 @@ from transformers import (
 from hart.modules.models.transformer import HARTForT2I
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt
 
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+SHARED_STATE_PATH = os.path.join(
+    REPO_ROOT, "fhat_images", "fhat_kv_stage_3.pt"
+)  # shared cache always uses stage 3
+
 
 def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
     if not store_separately and len(sample_imgs) > 1:
@@ -66,6 +71,9 @@ def main(args):
     text_tokenizer_max_length = args.max_token_length
 
     prompts = random.sample(default_prompts, args.batch_size)
+    shared_state_cache = None
+    if os.path.exists(SHARED_STATE_PATH):
+        shared_state_cache = torch.load(SHARED_STATE_PATH, map_location="cpu")
 
     with torch.inference_mode():
         with torch.autocast(
@@ -105,6 +113,10 @@ def main(args):
                 )
 
             # latency profile
+            # background_time = []
+            # for i in range(13):
+            shared_state = shared_state_cache
+            alpha_stage = 3
             start_time = time.time()
             for _ in tqdm(range(args.profile_iter)):
                 (
@@ -128,10 +140,14 @@ def main(args):
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
-                    is_shared_hart=True,
+                    is_shared_hart=shared_state is not None,
+                    save_fhat=False,
+                    alpha=alpha_stage,
+                    shared_state=shared_state,
                 )
             total_time = time.time() - start_time
-
+            # average_time = total_time / args.profile_iter
+            # background_time.append(average_time)
     average_time = total_time / args.profile_iter
     print(
         f"Generation with batch_size = {args.batch_size} take {average_time:2f}s per step."
