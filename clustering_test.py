@@ -5,7 +5,9 @@ from time import time
 from sklearn.cluster import KMeans
 import torch
 
-from cuml.cluster import HDBSCAN
+# from cuml.cluster import HDBSCAN
+from hdbscan import HDBSCAN
+
 from hart.clustering import Topic2VecClustering
 from hart.clustering.algos.bert_topic import BERTopicAnalyzer, load_qwen
 from hart.utils.datasets import load_mjhq
@@ -84,8 +86,8 @@ def main(
     if limit: 
         prompts = prompts[:limit]
 
-    # algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    algo = KMeans(n_clusters=50) # For Kmeans. 
+    algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
+    # algo = KMeans(n_clusters=50) # For Kmeans. 
 
     start = time()
     analyzer = BERTopicAnalyzer(clustering_model=algo, min_topic_size=3, n_components=3)
@@ -128,17 +130,19 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
-    with open('./../ILSVRC2012_devkit_t12/imagenet_classid_to_label.json') as f:
-        val_map = json.load(f)
+    with open("./../ILSVRC2012_devkit_t12/imagenet_classes.txt") as f:
+        imagenet_labels = [x.strip() for x in f.readlines()]
+    # with open('./../ILSVRC2012_devkit_t12/imagenet_classid_to_label.json') as f:
+    #     val_map = json.load(f)
 
-    imagenet_labels = []
+    # imagenet_labels = []
 
-    for label in val_map.values():
-        # Split at commas → e.g. "tench, Tinca tinca"
-        parts = label.split(',')
-        # Clean spaces and lowercase for consistency
-        parts = [p.strip().lower() for p in parts]
-        imagenet_labels.extend(parts)
+    # for label in val_map.values():
+    #     # Split at commas → e.g. "tench, Tinca tinca"
+    #     parts = label.split(',')
+    #     # Clean spaces and lowercase for consistency
+    #     parts = [p.strip().lower() for p in parts]
+    #     imagenet_labels.extend(parts)
 
     # Print results
     print("Total labels:", len(imagenet_labels))
@@ -146,7 +150,7 @@ if __name__ == "__main__":
 
     prompts = imagenet_labels
 
-    text_model_path = args.get('text_model_path')
+    text_model_path = "./../Qwen2-VL-1.5B-Instruct/"
     hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
     main(prompts, text_model_path, limit = None, **hdb_config)
     # test_BertTopic(prompts, text_model_path)
