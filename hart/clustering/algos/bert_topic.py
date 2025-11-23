@@ -412,7 +412,7 @@ def load_qwen(
 
     with torch.no_grad():
 
-        total_pca_time = 0
+        # total_pca_time = 0
         for batch_idx, (input_ids, attention_mask) in tqdm(enumerate(dataloader)):
             if batch_idx == 1: 
                 start = time()
@@ -430,11 +430,11 @@ def load_qwen(
             torch.cuda.empty_cache()
 
         all_embeddings = torch.cat(all_embeddings, dim=0)  # (N, seq_len, hidden_dim)
-        start_pca = time()
-        all_embeddings = pca_lowrank(all_embeddings.reshape(len(text_inp), -1), top_n_components=100) 
-        end_pca =  time()
-        total_pca_time += start_pca - end_pca
+        # start_pca = time()
+        # all_embeddings = pca_lowrank(all_embeddings.reshape(len(text_inp), -1), top_n_components=100) 
+        # end_pca =  time()
+        # total_pca_time += start_pca - end_pca
     end = time()
     print(f"total time taken is: {end - start}")
-    print(f"Total time taken for PCA is: {total_pca_time}")
+
     return all_embeddings
