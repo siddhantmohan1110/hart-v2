@@ -1,12 +1,14 @@
 import argparse
-from hart.clustering import Topic2VecClustering
-from hart.utils.datasets import load_mjhq
+import json
 from time import time
-from hart.clustering.algos.bert_topic import BERTopicAnalyzer, load_qwen
+
+from sklearn.cluster import KMeans
+import torch
 
 from cuml.cluster import HDBSCAN
-from sklearn.cluster import KMeans
-import torch 
+from hart.clustering import Topic2VecClustering
+from hart.clustering.algos.bert_topic import BERTopicAnalyzer, load_qwen
+from hart.utils.datasets import load_mjhq
 
 
 
@@ -63,6 +65,50 @@ def test_BertTopic(prompts, text_model_path, limit=10**5):
         print(f"Input reading IO time = {read_time - start}")
 
 
+def main(
+        prompts,
+        text_model_path,
+        limit=10**5,
+        batch_size=128,
+        **hdb_configs):
+
+    if limit: 
+        prompts = prompts[:limit]
+
+    embeddings = load_qwen(prompts, text_model_path, batch_size=batch_size)
+    np_embed = embeddings.cpu().numpy()
+    del embeddings
+    torch.cuda.empty_cache()
+
+
+    if limit: 
+        prompts = prompts[:limit]
+
+    # algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
+    algo = KMeans(n_clusters=50) # For Kmeans. 
+
+    start = time()
+    analyzer = BERTopicAnalyzer(clustering_model=algo, min_topic_size=3, n_components=3)
+        
+    read_time = time()
+    # fit the clustering 
+    analyzer.fit_model(prompts, np_embed)
+
+    # assign the documents to the class. 
+    analyzer.documents = prompts
+
+    
+
+
+    end = time()
+    print(f"Total Time = {end - start}")
+    print(f"Input reading IO time = {read_time - start}")
+    print("Visualizing")
+    analyzer.visualize_3d_interactive()
+    print("finished visualizing")
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -81,8 +127,28 @@ if __name__ == "__main__":
 
 
     args = parser.parse_args()
-    prompts = load_mjhq(args.get('mjhq-meta-path'))
+    # prompts = load_mjhq(args.get('mjhq-meta-path'))
+    with open('./../ILSVRC2012_devkit_t12/imagenet_classid_to_label.json') as f:
+        val_map = json.load(f)
+
+    imagenet_labels = []
+
+    for label in val_map.values():
+        # Split at commas → e.g. "tench, Tinca tinca"
+        parts = label.split(',')
+        # Clean spaces and lowercase for consistency
+        parts = [p.strip().lower() for p in parts]
+        imagenet_labels.extend(parts)
+
+    # Print results
+    print("Total labels:", len(imagenet_labels))
+    print(imagenet_labels[:10])
+
+    prompts = imagenet_labels
+
     text_model_path = args.get('text_model_path')
-    test_BertTopic(prompts, text_model_path)
+    hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
+    main(prompts, text_model_path, limit = None, **hdb_config)
+    # test_BertTopic(prompts, text_model_path)
 
     # test_TTV(prompts)
