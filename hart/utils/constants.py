@@ -23,3 +23,67 @@ User Prompt:\n"""
 
 max_seq_len = 10240
 max_batch_size = 16
+
+artificial_prompts3 = [
+    # Group 1 — Landscapes & Nature
+    "A misty mountain valley at sunrise with a river flowing through pine forests.",
+    "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
+    "A tropical beach with turquoise waters and palm trees swaying in the wind.",
+    "A desert landscape with red sand dunes and a caravan of camels at dusk.",
+
+    # Group 2 — Futuristic & Sci-Fi Cityscapes
+    "A futuristic city skyline with neon lights and flying cars at night.",
+    "A cyberpunk street market filled with holographic signs and robots.",
+    "A floating city above the clouds powered by solar sails and wind turbines.",
+
+    # Group 3 — Artistic Portraits
+    "A surreal portrait of a woman with galaxies in her eyes and nebula hair.",
+    "An oil painting of an old sailor with deep wrinkles and a weathered gaze.",
+    "A minimalist black-and-white sketch of a young artist painting a mural.",
+
+    # Group 4 — Fantasy & Mythical Worlds
+    "A dragon soaring over a medieval castle surrounded by glowing runes.",
+    "An elven forest village with bioluminescent plants and crystal streams.",
+    "A battle between a knight and a shadow creature under a blood moon.",
+
+    # Group 5 — Abstract & Conceptual Art
+    "A geometric abstraction representing time as flowing ribbons of color.",
+    "Fractal patterns resembling a blooming flower made of glass shards.",
+    "An AI-generated dreamscape merging city lights and neural networks.",
+
+    # Group 6 — Realistic Everyday Scenes
+    "A rainy street in Tokyo with reflections of neon signs on wet pavement.",
+    "A farmer’s market in summer with people buying fresh fruits and flowers.",
+    "A cozy café interior with sunlight streaming through dusty windows.",
+    "A parked vintage car beside a diner under warm evening light."
+]
+
+artificial_prompts2 = [
+    "A misty mountain valley at sunrise with a river flowing through pine forests.",
+    "Snow-covered peaks under a purple sunset sky, seen from a wooden cabin window.",
+    "A tropical beach with turquoise waters and palm trees swaying in the wind.",
+    "A desert landscape with red sand dunes and a caravan of camels at dusk.",  
+]
+
+artificial_prompts = [
+    "A black cat jumping from a vintage mountain",
+    "A black cat smoking cigar in a mosaic painting",
+    "A black cat laughing on vintage street",
+    "A black cat dancing under a vintage lamp",
+    "A black cat painting on an old brick wall",
+    "A black cat reading a newspaper in a sepia café",
+    "A black cat riding a bicycle on a cobblestone street",
+    "A black cat sipping tea in a vintage train",
+    "A black cat playing violin on an antique balcony",
+    "A black cat wearing a hat in a retro portrait",
+    "A black cat posing beside an old phonograph",
+    "A black cat resting on a Victorian chair",
+    "A black cat dreaming in a faded oil painting",
+    "A black cat walking through an art deco alley",
+    "A black cat sketching on a rustic canvas",
+    "A black cat gazing at lanterns in a vintage fair",
+    "A black cat writing letters on an antique desk",
+    "A black cat standing near a classic typewriter",
+    "A black cat singing beside a gramophone",
+    "A black cat smoking pipe in a faded mural"
+]

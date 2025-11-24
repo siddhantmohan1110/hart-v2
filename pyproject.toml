@@ -24,6 +24,7 @@ dependencies = [
     "omegaconf==2.3.0", "diffusers==0.28.2", "seaborn==0.13.2",
     "einx", "wandb", "xformers==0.0.29.post2", "plotly>=5.18.0,<6.0",
     "spaces==0.30.3", "pre-commit==4.0.1", "black==24.10.0", "isort==5.13.2",
+    "bertopic==0.17.3", "hdbscan==0.8.40", "umap-learn==0.5.9.post2", "seaborn==0.13.2"
 ]
 
 [tool.setuptools.packages.find]

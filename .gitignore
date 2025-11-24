@@ -149,6 +149,16 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Datasets
+
+MJHQ-30K/
+Miniforge3-Linux-x86_64.sh
+Qwen2-VL-1.5B-Instruct/
+hart-0.7b-1024px/
+hart-50G-10M.ext3
+shieldgemma-2b
+
+
 # Cython debug symbols
 cython_debug/
 

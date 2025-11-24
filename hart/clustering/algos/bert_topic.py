@@ -13,7 +13,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from bertopic import BERTopic
-from cuml.manifold import UMAP
+# from cuml.manifold import UMAP
+from hdbscan import HDBSCAN
+
+from umap import UMAP
 
 import transformers
 from transformers import (
@@ -99,7 +102,7 @@ class BERTopicAnalyzer:
         self.documents = self.load_data()
         print(f"Created {len(self.documents)} custom documents")
         
-    def fit_model(self, documents = None, embeddings = None):
+    def fit_model(self, documents = None, embeddings = None, save_path: str | None = None):
         """
         Fit the BERTopic model to the documents.
         
@@ -141,6 +144,11 @@ class BERTopicAnalyzer:
         
         print("Fitting model to documents...")
         self.topics, self.probabilities = self.topic_model.fit_transform(documents, embeddings)
+
+        if save_path:
+            # Persist the fitted model so it can be loaded and extended later.
+            self.topic_model.save(save_path)
+            print(f"Saved BERTopic model to: {save_path}")
 
 
         if embeddings is None: 
@@ -394,8 +402,9 @@ def load_qwen(
     text_model_path,
     batch_size=8,
     num_workers=2,
-    device="cuda",
+    max_token_length=10
 ):
+    tokenizer = AutoTokenizer.from_pretrained(text_model_path)
     dataset = TextDataset(text_inp)
     dataloader = DataLoader(
                     dataset,
@@ -405,11 +414,18 @@ def load_qwen(
                     collate_fn=lambda x: collate_fn(x, tokenizer, max_token_length)
                 )
    
-    all_embeddings = []
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    model = AutoModel.from_pretrained(text_model_path)
+    model = model.to(device)
+    
     model.eval()
     torch.cuda.empty_cache()
     torch.set_grad_enabled(False)
 
+    all_embeddings = []
     with torch.no_grad():
 
         # total_pca_time = 0
@@ -425,16 +441,18 @@ def load_qwen(
                 attention_mask=attention_mask,
                 output_hidden_states=False,
             )
-            last_hidden_state = outputs.last_hidden_state  # convert fp16 → fp32 for stability
-            all_embeddings.append(last_hidden_state)
+            last_hidden_state = outputs.last_hidden_state  # (batch, seq_len, hidden_dim)
+            # Flatten sequence and hidden dims so downstream expects 2D shape
+            flat_embeddings = last_hidden_state.reshape(last_hidden_state.size(0), -1)
+            all_embeddings.append(flat_embeddings)
             torch.cuda.empty_cache()
 
-        all_embeddings = torch.cat(all_embeddings, dim=0)  # (N, seq_len, hidden_dim)
+        all_embeddings = torch.cat(all_embeddings, dim=0)  # (N, seq_len * hidden_dim)
         # start_pca = time()
         # all_embeddings = pca_lowrank(all_embeddings.reshape(len(text_inp), -1), top_n_components=100) 
         # end_pca =  time()
         # total_pca_time += start_pca - end_pca
     end = time()
     print(f"total time taken is: {end - start}")
-
+    # print(f"Total time taken for PCA is: {total_pca_time}")
     return all_embeddings
