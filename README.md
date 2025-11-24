@@ -68,3 +68,15 @@ pip install --upgrade cupy-cuda12x -f https://pip.cupy.dev/aarch64
 ## Acknowledgements
 
 Our codebase is inspired by amazing open source research projects such as [HART](https://github.com/mit-han-lab/hart) and [VAR](https://github.com/FoundationVision/VAR).
+
+
+## ImageNet Label Clustering. 
+1. Download the imageNet 50K labels and the synset. 
+2. You should also downlaod the `meta.mat` that has the metadata for the labelID --> Human Readable class names metadata.
+3. Run the `imagenet_label_extraction.py`. Make sure to change the path of the imagenet file. 
+4. Run the `clustering_test.py`. It will read from  the `imagenet_val_filename_to_label.json`. 
+5. If you want the full pipeine of clustering, and fittiing new prompts to a cluster - youc an run `extend_bertopic.py`. 
+    - Make sure that you have all the synset labels line by line when you run this file. Else you will have to modify the code where it reads the prompts from a file. 
+    - This was by design to make sure that the clustering pipeline is generic enough..
+
+    

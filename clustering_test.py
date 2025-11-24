@@ -71,6 +71,7 @@ def main(
         prompts,
         text_model_path,
         limit=10**5,
+        clustering_algo="hdbscan",
         batch_size=128,
         **hdb_configs):
 
@@ -86,8 +87,13 @@ def main(
     if limit: 
         prompts = prompts[:limit]
 
-    algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    # algo = KMeans(n_clusters=50) # For Kmeans. 
+    if clustering_algo.lower() == "hdbscan":
+        algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
+    
+    else:
+        print(f"Provided algo is: {clustering_algo.lower()}")
+        print(f"Starting Kmeans")
+        algo = KMeans(n_clusters=100) # For Kmeans. 
 
     start = time()
     analyzer = BERTopicAnalyzer(clustering_model=algo, min_topic_size=3, n_components=3)
@@ -121,14 +127,21 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--clustering_algo",
+        type=str,
+        help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
+        default="hdbscan"
+    )
+    parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct",
+        default="./../Qwen2-VL-1.5B-Instruct/",
     )
 
 
     args = parser.parse_args()
+    clustering_algo = args.clustering_algo
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
     with open("./../ILSVRC2012_devkit_t12/imagenet_classes.txt") as f:
         imagenet_labels = [x.strip() for x in f.readlines()]
@@ -150,9 +163,9 @@ if __name__ == "__main__":
 
     prompts = imagenet_labels
 
-    text_model_path = "./../Qwen2-VL-1.5B-Instruct/"
+    text_model_path = args.text_model_path
     hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    main(prompts, text_model_path, limit = None, **hdb_config)
+    main(prompts, text_model_path, limit = None, clustering_algo=clustering_algo, batch_size=128, **hdb_config)
     # test_BertTopic(prompts, text_model_path)
 
     # test_TTV(prompts)
