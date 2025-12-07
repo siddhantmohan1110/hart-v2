@@ -143,7 +143,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     clustering_algo = args.clustering_algo
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
-    with open("./../ILSVRC2012_devkit_t12/imagenet_classes.txt") as f:
+    with open("data/imagenet_classes.txt") as f:
         imagenet_labels = [x.strip() for x in f.readlines()]
     # with open('./../ILSVRC2012_devkit_t12/imagenet_classid_to_label.json') as f:
     #     val_map = json.load(f)
