@@ -35,18 +35,31 @@ from transformers import (
 from hart.modules.models.transformer import HARTForT2I
 
 
-def test_TTV(prompts):
-    ttv = Topic2VecClustering()
-    ttv.init_model(prompts)
-    # Simplified version
-    fig_simple = ttv.plot_interactive_with_centroids(
-        file_name="simple_centroids_0_05_dist",
-        save_path="./",
-        show_fig=True
-    )
+# def test_TTV(prompts):
+#     ttv = Topic2VecClustering()
+#     ttv.init_model(prompts)
+#     # Simplified version
+#     fig_simple = ttv.plot_interactive_with_centroids(
+#         file_name="simple_centroids_0_05_dist",
+#         save_path="./",
+#         show_fig=True
+#     )
 
 
-#(prompts, text_model_path, limit=10**5):
+def test_BertTopic(prompts, text_model_path, limit=10**5):
+
+    if limit: 
+        prompts = prompts[:limit]
+
+    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
+
+    for idx, prompt in enumerate(prompts):
+        prompts[idx] = base_prompt + " " + prompt
+
+    embeddings = load_qwen(prompts, text_model_path, batch_size=128)
+    np_embed = embeddings.cpu().numpy()
+    del embeddings
+    torch.cuda.empty_cache()
 
     if limit: 
         prompts = prompts[:limit]
@@ -175,8 +188,11 @@ def main(
 
 Write the prompt as if you want the image to be generated, not described. Do NOT describe a list, do NOT mention prompts, summaries, clusters, or collections.
 
-Strictly avoid meta or generic phrasing such as:
-"collection", "various", "diverse", "depicting", "images", "visual similarity", "objects", "subject", "scene showing".
+The value must be a single sentence image-generation prompt.
+
+Strictly avoid meta or generic phrasing.
+
+Banned content (must not appear anywhere): prompt, prompts, answer, inference, summary, cluster, collection, various, depicting, output, to generate, the image should, diverse, images, visual similarity, objects, subject, scene showing, categories
 
 Task:
 From the prompts below, infer the most plausible shared visual concept and write ONE concise, visually grounded image-generation prompt.
@@ -195,7 +211,6 @@ Hard Constraints:
 - No bullet points, lists, quotes, or line breaks.
 - No explanations or commentary.
 - Produce exactly ONE prompt and nothing else.
-- Strictly avoid meta or generic phrasing such as: "collection", "various", "diverse", "depicting", "images", "visual similarity", "objects", "subject", "scene showing".
 
 Prompts:
 {prompts_text}
@@ -208,25 +223,78 @@ Prompt:"""
         with torch.no_grad():
             outputs = qwen_model.generate(
                 **inputs,
-                max_new_tokens=150,
-                temperature=0.7,
+                max_new_tokens=40,
+                temperature=0.2,
                 do_sample=True,
-                top_p=0.9
+                top_p=0.9,
+                repetition_penalty=1.2,
             )
 
         # Decode only the newly generated tokens (skip the input prompt)
         input_length = inputs['input_ids'].shape[1]
         generated_tokens = outputs[0][input_length:]
-        summary = qwen_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        summary_raw = qwen_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        # Normalize whitespace, drop newlines, and keep only the first sentence.
+        summary = " ".join(summary_raw.split()).replace("\\", "")
+        first_sentence = re.split(r"[.\n]", summary, maxsplit=1)[0].strip()
+        summary = first_sentence or summary
+        # Keep only letters, periods, commas, and spaces.
+        summary = re.sub(r"[^A-Za-z., ]+", "", summary)
+        # Remove banned meta words/phrases.
+        banned_terms = [
+            "prompt",
+            "prompts",
+            "answer",
+            "inference",
+            "summary",
+            "cluster",
+            "collection",
+            "various",
+            "depicting",
+            "output",
+            "to generate",
+            "the image should",
+            "diverse",
+            "images",
+            "visual similarity",
+            "objects",
+            "subject",
+            "scene showing",
+            "categories",
+        ]
+        for term in banned_terms:
+            summary = re.sub(rf"\b{re.escape(term)}\b", "", summary, flags=re.IGNORECASE)
+        summary = " ".join(summary.split()).strip("., ")
 
         summary_centroids[topic_id] = summary
         print(f"Cluster {topic_id} summary: {summary[:100]}...")
+
+    # Merge clusters that ended up with identical cleaned summaries.
+    summary_key_map = {}
+    merged_summary_centroids = {}
+    merged_info = {}
+    for topic_id, summary in summary_centroids.items():
+        key = summary.lower()
+        if key in summary_key_map:
+            primary_id = summary_key_map[key]
+            merged_info.setdefault(primary_id, []).append(topic_id)
+        else:
+            summary_key_map[key] = topic_id
+            merged_summary_centroids[topic_id] = summary
+    if merged_info:
+        print("\nMerging clusters with identical summaries:")
+        for primary_id, merged_ids in merged_info.items():
+            print(f"  Keeping {primary_id}, merging {merged_ids}")
+    summary_centroids = merged_summary_centroids
 
     # Save summary centroids to file
     with open("summary_centroids.json", "w") as f:
         json.dump(summary_centroids, f, indent=2)
 
     print(f"\nSaved summaries for {len(summary_centroids)} clusters to summary_centroids.json")
+
+    if args.stop_with_centroid_summaries:
+        return None
 
     # Clean up qwen model before loading HART
     del qwen_model
@@ -397,6 +465,8 @@ if __name__ == "__main__":
         default=True,
     )
 
+    parser.add_argument("--stop_with_centroid_summaries", action="store_true", help="If set, the program will stop after generating centroid summaries.")
+
     args = parser.parse_args()
     clustering_algo = args.clustering_algo
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
@@ -416,8 +486,6 @@ if __name__ == "__main__":
 
     # Print results
     print("Total labels:", len(imagenet_labels))
-    print(imagenet_labels[:10])
-
     prompts = imagenet_labels
 
     text_model_path = args.text_model_path
