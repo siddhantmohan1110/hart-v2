@@ -1,17 +1,37 @@
+import sys
+sys.modules['tensorflow'] = None
+import os
+os.environ['TRANSFORMERS_NO_TF'] = '1'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import argparse
 import json
 from time import time
-
+import argparse
+import copy
+import numpy as np
+import torchvision
+from PIL import Image
+from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
 from sklearn.cluster import KMeans
 import torch
 
 # from cuml.cluster import HDBSCAN
 from hdbscan import HDBSCAN
 
-from hart.clustering import Topic2VecClustering
+# from hart.clustering import Topic2VecClustering
 from hart.clustering.algos.bert_topic import BERTopicAnalyzer, load_qwen
 from hart.utils.datasets import load_mjhq
 
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    HfArgumentParser,
+    set_seed,
+)
+
+from hart.modules.models.transformer import HARTForT2I
 
 
 def test_TTV(prompts):
@@ -25,7 +45,7 @@ def test_TTV(prompts):
     )
 
 
-def test_BertTopic(prompts, text_model_path, limit=10**5):
+#(prompts, text_model_path, limit=10**5):
 
     if limit: 
         prompts = prompts[:limit]
@@ -47,10 +67,10 @@ def test_BertTopic(prompts, text_model_path, limit=10**5):
     hdbscan = HDBSCAN(min_samples=3, gen_min_span_tree=True, prediction_data=True)
     kmeans = KMeans(n_clusters=50)
 
-    for cls in [hdbscan, kmeans]: 
+    for cls in [hdbscan, kmeans]:
         start = time()
         analyzer = BERTopicAnalyzer(clustering_model=cls, min_topic_size=3, n_components=3)
-            
+
             # Choose data source (comment/uncomment as needed)
         # Option 1: Use custom documents
         # analyzer.create_custom_documents()
@@ -59,11 +79,11 @@ def test_BertTopic(prompts, text_model_path, limit=10**5):
 
         # Option 2: Load from 20 newsgroups (uncomment to use)
         # analyzer.load_sample_data(n_samples=500)
-        
+
         # Option 3: Use your own documents (uncomment and modify)
         # analyzer.load_data()
         # analyzer.documents = your_documents
-        
+
         # Fit the model
         # analyzer.fit_model()
         end = time()
@@ -91,9 +111,9 @@ def main(
     if limit: 
         prompts = prompts[:limit]
 
-    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
+    #base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
     for idx, prompt in enumerate(prompts):
-        prompts[idx] = base_prompt + " " + prompt
+        prompts[idx] =  prompt
 
     if clustering_algo.lower() == "hdbscan":
         algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
@@ -120,28 +140,147 @@ def main(
 
     topic_embeddings = analyzer.topic_model.topic_embeddings_
 
-    
+    # Get topic assignments for each document
+    topics = analyzer.topic_model.topics_
+    topic_info = analyzer.topic_model.get_topic_info()
+
+    # Group prompts by cluster/topic
+    cluster_prompts = {}
+    for doc_idx, topic_id in enumerate(topics):
+        if topic_id not in cluster_prompts:
+            cluster_prompts[topic_id] = []
+        cluster_prompts[topic_id].append(prompts[doc_idx])
+
+    print(f"Found {len(cluster_prompts)} clusters")
+
+    # Load qwen model for summarization
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    qwen_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
+    qwen_model = AutoModelForCausalLM.from_pretrained(
+        text_model_path,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+
+    # Generate summaries for each cluster
+    summary_centroids = {}
+
+    for topic_id, topic_prompts in cluster_prompts.items():
+        print(f"Processing cluster {topic_id} with {len(topic_prompts)} prompts...")
+
+        # Create a prompt for summarization
+        prompts_text = "\n".join([f"- {p}" for p in topic_prompts[:100]])  # Limit to first 100 to avoid token limits
+        summarization_prompt = f"""Given the following list of image generation prompts, all of which describe visually related concepts, generate a SINGLE concise summary prompt that captures their shared visual characteristics.
+
+The summary will be used directly as conditioning input to a text-to-image generation model. It must therefore be visually grounded, concrete, and optimized for generative reuse.
+
+Guidelines:
+- Focus on shared visual attributes such as object category, shape, texture, material, color, typical pose or viewpoint, and common environment if applicable.
+- Capture only what is common across the prompts; ignore rare or class-specific details.
+- Do NOT list or reference individual class names or labels.
+- Do NOT mention that this is a summary, cluster, or aggregation.
+- Avoid abstract, symbolic, or non-visual language.
+- Avoid stylistic adjectives unless they are strongly implied by the cluster.
+- The output must be a single fluent natural-language prompt suitable for image generation.
+
+Constraints:
+- Output length: 1-2 sentences only.
+- Output must not exceed 50 tokens.
+- Do not use bullet points, lists, or line breaks.
+- Do not include explanations, meta-commentary, or formatting.
+- Do not repeat the input prompts verbatim.
+- Produce exactly ONE prompt and nothing else.
+
+Prompts:
+{prompts_text}
+
+Summary prompt:"""
+
+        # Tokenize and generate summary
+        inputs = qwen_tokenizer(summarization_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+
+        with torch.no_grad():
+            outputs = qwen_model.generate(
+                **inputs,
+                max_new_tokens=150,
+                temperature=0.7,
+                do_sample=True,
+                top_p=0.9
+            )
+
+        # Decode only the newly generated tokens (skip the input prompt)
+        input_length = inputs['input_ids'].shape[1]
+        generated_tokens = outputs[0][input_length:]
+        summary = qwen_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+
+        summary_centroids[topic_id] = summary
+        print(f"Cluster {topic_id} summary: {summary[:100]}...")
+
+    # Save summary centroids to file
+    with open("summary_centroids.json", "w") as f:
+        json.dump(summary_centroids, f, indent=2)
+
+    print(f"\nSaved summaries for {len(summary_centroids)} clusters to summary_centroids.json")
+
+    # Clean up qwen model before loading HART
+    del qwen_model
+    del qwen_tokenizer
+    torch.cuda.empty_cache()
+
+    # Load HART model for generating f_hats from summaries
+    print("\nLoading HART model...")
+    hart_model = AutoModel.from_pretrained(args.model_path)
+    hart_model = hart_model.to(device)
+    hart_model.eval()
+
+    if args.use_ema:
+        ema_model = copy.deepcopy(hart_model)
+        ema_model.load_state_dict(
+            torch.load(os.path.join(args.model_path, "ema_model.bin"))
+        )
+
+    # Load text model for encoding summaries
+    hart_text_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
+    hart_text_model = AutoModel.from_pretrained(text_model_path).to(device)
+    hart_text_model.eval()
+
+    # Generate f_hats for each summary centroid with alpha=3
+    fhat_centroids = {}
+    cluster_output_images = []
+    alpha = 3
+    fhat_save_path = "./fhat_centroids"
+    os.makedirs(fhat_save_path, exist_ok=True)
+
+    print(f"\nGenerating f_hats for {len(summary_centroids)} cluster summaries with alpha={alpha}...")
+
     with torch.inference_mode():
-        with torch.autocast(
-            "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
-        ):
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-            for idx, embedding in enumerate(topic_embeddings):
-                print(f"Topic {idx}: {embedding}")
+        with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
+            for topic_id, summary in summary_centroids.items():
+                print(f"Processing summary for cluster {topic_id}...")
 
-                if idx == 5: 
-                    start_time = time.time()
-                    print(f"Starting time for topic {idx}: {start_time}")
+                # Encode the summary using the same function from sample.py
+                (
+                    context_tokens,
+                    context_mask,
+                    context_position_ids,
+                    context_tensor,
+                ) = encode_prompts(
+                    [summary],  # Pass as list
+                    hart_text_model,
+                    hart_text_tokenizer,
+                    args.max_token_length,
+                    llm_system_prompt,
+                    args.use_llm_system_prompt,
+                )
 
-                context_tensor = embedding.to(device).float()
-                context_position_ids = torch.zeros(context_tensor.size(0), dtype=torch.long)
-                context_mask = torch.ones(context_tensor.size(0), dtype=torch.long)
-
+                # Select inference function based on EMA usage
                 infer_func = (
                     ema_model.autoregressive_infer_cfg
                     if args.use_ema
-                    else model.autoregressive_infer_cfg
+                    else hart_model.autoregressive_infer_cfg
                 )
+
+                # Forward pass through HART with save_fhat=True and alpha=3
                 output_imgs = infer_func(
                     B=context_tensor.size(0),
                     label_B=context_tensor,
@@ -150,12 +289,54 @@ def main(
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
-                    save_fhat=False,
+                    save_fhat=True,
+                    save_fhat_path=fhat_save_path,
+                    alpha=alpha,
                     is_shared_hart=False,
                 )
 
-    total_time = time.time() - start_time
-    print(f"Generate {len(prompts)} images take {total_time:2f}s.")
+                # Store the output image for grid creation
+                cluster_output_images.append(output_imgs[0])
+
+                # Load the saved f_hat for this cluster
+                fhat_file = os.path.join(fhat_save_path, f'fhat_kv_stage_{alpha}.pt')
+                if os.path.exists(fhat_file):
+                    fhat_data = torch.load(fhat_file)
+                    fhat_centroids[topic_id] = fhat_data['f_hat']
+                    print(f"Saved f_hat for cluster {topic_id} with shape {fhat_data['f_hat'].shape}")
+                    # Clean up the temporary file
+                    os.remove(fhat_file)
+                else:
+                    print(f"Warning: f_hat file not found for cluster {topic_id}")
+
+    # Create and save grid image of all cluster centroids
+    if cluster_output_images:
+        # Stack all images and create grid
+        cluster_images_tensor = torch.stack(cluster_output_images)
+        grid = torchvision.utils.make_grid(cluster_images_tensor, nrow=min(8, len(cluster_output_images)))
+        grid_np = grid.to(torch.float16).permute(1, 2, 0).mul_(255).cpu().numpy()
+        grid_np = Image.fromarray(grid_np.astype(np.uint8))
+
+        grid_save_path = "cluster_centroids_grid.png"
+        grid_np.save(grid_save_path)
+        print(f"\nSaved grid of {len(cluster_output_images)} cluster centroid images to {grid_save_path}")
+
+    # Save all f_hat centroids
+    torch.save(fhat_centroids, "fhat_centroids.pt")
+    print(f"\nSaved f_hats for {len(fhat_centroids)} clusters to fhat_centroids.pt")
+
+    # Clean up
+    del hart_model
+    if args.use_ema:
+        del ema_model
+    del hart_text_model
+    del hart_text_tokenizer
+    torch.cuda.empty_cache()
+
+    
+
+    # total_time = time.time() - start_time
+    # print(f"Generate {len(prompts)} images take {total_time:2f}s.")
     
     # print("Visualizing")
     # analyzer.visualize_3d_interactive()
@@ -184,7 +365,25 @@ if __name__ == "__main__":
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
         default="Qwen2-VL-1.5B-Instruct/",
     )
-
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        help="The path to HART model.",
+        default="hart-0.7b-1024px/llm",
+    )
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--use_ema", type=bool, default=True)
+    parser.add_argument("--max_token_length", type=int, default=300)
+    parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
+    parser.add_argument(
+        "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
+    )
+    parser.add_argument(
+        "--more_smooth",
+        type=bool,
+        help="Turn on for more visually smooth samples.",
+        default=True,
+    )
 
     args = parser.parse_args()
     clustering_algo = args.clustering_algo
