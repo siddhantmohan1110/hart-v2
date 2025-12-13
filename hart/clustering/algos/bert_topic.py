@@ -453,6 +453,6 @@ def load_qwen(
         # end_pca =  time()
         # total_pca_time += start_pca - end_pca
     end = time()
-    print(f"total time taken is: {end - start}")
+    print(f"Model loading time: {end - start}")
     # print(f"Total time taken for PCA is: {total_pca_time}")
     return all_embeddings

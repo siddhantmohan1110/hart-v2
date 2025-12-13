@@ -164,7 +164,7 @@ def build_parser():
         help="Directory to store generated images.",
         default="data/imagenet_prompt_images",
     )
-    parser.add_argument("--batch_size", type=int, default=4, help="Number of prompts per batch.")
+    parser.add_argument("--batch_size", type=int, default=8, help="Number of prompts per batch.")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--use_ema", type=bool, default=True)
     parser.add_argument("--max_token_length", type=int, default=300)

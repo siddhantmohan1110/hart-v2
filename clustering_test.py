@@ -105,12 +105,9 @@ def main(
     # assign the documents to the class. 
     analyzer.documents = prompts
 
-    
-
-
     end = time()
-    print(f"Total Time = {end - start}")
     print(f"Input reading IO time = {read_time - start}")
+    print(f"Total Time = {end - start}")
     print("Visualizing")
     analyzer.visualize_3d_interactive()
     print("finished visualizing")
@@ -136,7 +133,7 @@ if __name__ == "__main__":
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="./../Qwen2-VL-1.5B-Instruct/",
+        default="Qwen2-VL-1.5B-Instruct/",
     )
 
 
