@@ -40,7 +40,7 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
             cur_img = sample_imgs_np[img_idx]
             cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
             cur_img_store = Image.fromarray(cur_img)
-            cur_img_store.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_{img_idx:06d}.png"))
+            cur_img_store.save(os.path.join(sample_folder_dir, f"{img_idx:06d}_{time.strftime("%Y%m%d_%H%M%S")}.png"))
             print(f"Image {img_idx} saved.")
 
     with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
