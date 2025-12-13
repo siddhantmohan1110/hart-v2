@@ -272,24 +272,42 @@ Prompt:"""
     # Merge clusters that ended up with identical cleaned summaries.
     summary_key_map = {}
     merged_summary_centroids = {}
+    merged_cluster_prompts = {}
     merged_info = {}
     for topic_id, summary in summary_centroids.items():
         key = summary.lower()
         if key in summary_key_map:
             primary_id = summary_key_map[key]
             merged_info.setdefault(primary_id, []).append(topic_id)
+            merged_cluster_prompts[primary_id].extend(cluster_prompts.get(topic_id, []))
         else:
             summary_key_map[key] = topic_id
             merged_summary_centroids[topic_id] = summary
+            merged_cluster_prompts[topic_id] = list(cluster_prompts.get(topic_id, []))
     if merged_info:
         print("\nMerging clusters with identical summaries:")
         for primary_id, merged_ids in merged_info.items():
             print(f"  Keeping {primary_id}, merging {merged_ids}")
     summary_centroids = merged_summary_centroids
+    cluster_prompts = merged_cluster_prompts
+
+    # Save summary centroids ordered by increasing cluster_id.
+    def _cluster_sort_key(cid):
+        cid_str = str(cid)
+        if cid_str.lstrip("-").isdigit():
+            return (0, int(cid))
+        return (1, cid_str)
+
+    ordered_ids = sorted(summary_centroids.keys(), key=_cluster_sort_key)
+    ordered_summary_centroids = {cid: summary_centroids[cid] for cid in ordered_ids}
+    ordered_cluster_prompts = {cid: cluster_prompts[cid] for cid in ordered_ids}
 
     # Save summary centroids to file
     with open("summary_centroids.json", "w") as f:
-        json.dump(summary_centroids, f, indent=2)
+        json.dump(ordered_summary_centroids, f, indent=2)
+    # Save prompts grouped by cluster_id to file
+    with open("cluster_prompts.json", "w") as f:
+        json.dump(ordered_cluster_prompts, f, indent=2)
 
     print(f"\nSaved summaries for {len(summary_centroids)} clusters to summary_centroids.json")
 
