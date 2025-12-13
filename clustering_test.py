@@ -30,6 +30,11 @@ def test_BertTopic(prompts, text_model_path, limit=10**5):
     if limit: 
         prompts = prompts[:limit]
 
+    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
+
+    for idx, prompt in enumerate(prompts):
+        prompts[idx] = base_prompt + " " + prompt
+
     embeddings = load_qwen(prompts, text_model_path, batch_size=128)
     np_embed = embeddings.cpu().numpy()
     del embeddings
@@ -51,7 +56,6 @@ def test_BertTopic(prompts, text_model_path, limit=10**5):
         # analyzer.create_custom_documents()
         read_time = time()
         analyzer.fit_model(prompts, np_embed)
-        analyzer.documents = prompts
 
         # Option 2: Load from 20 newsgroups (uncomment to use)
         # analyzer.load_sample_data(n_samples=500)
@@ -87,6 +91,10 @@ def main(
     if limit: 
         prompts = prompts[:limit]
 
+    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
+    for idx, prompt in enumerate(prompts):
+        prompts[idx] = base_prompt + " " + prompt
+
     if clustering_algo.lower() == "hdbscan":
         algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
     
@@ -108,9 +116,50 @@ def main(
     end = time()
     print(f"Input reading IO time = {read_time - start}")
     print(f"Total Time = {end - start}")
-    print("Visualizing")
-    analyzer.visualize_3d_interactive()
-    print("finished visualizing")
+
+
+    topic_embeddings = analyzer.topic_model.topic_embeddings_
+
+    
+    with torch.inference_mode():
+        with torch.autocast(
+            "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
+        ):
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            for idx, embedding in enumerate(topic_embeddings):
+                print(f"Topic {idx}: {embedding}")
+
+                if idx == 5: 
+                    start_time = time.time()
+                    print(f"Starting time for topic {idx}: {start_time}")
+
+                context_tensor = embedding.to(device).float()
+                context_position_ids = torch.zeros(context_tensor.size(0), dtype=torch.long)
+                context_mask = torch.ones(context_tensor.size(0), dtype=torch.long)
+
+                infer_func = (
+                    ema_model.autoregressive_infer_cfg
+                    if args.use_ema
+                    else model.autoregressive_infer_cfg
+                )
+                output_imgs = infer_func(
+                    B=context_tensor.size(0),
+                    label_B=context_tensor,
+                    cfg=args.cfg,
+                    g_seed=args.seed,
+                    more_smooth=args.more_smooth,
+                    context_position_ids=context_position_ids,
+                    context_mask=context_mask,
+                    save_fhat=False,
+                    is_shared_hart=False,
+                )
+
+    total_time = time.time() - start_time
+    print(f"Generate {len(prompts)} images take {total_time:2f}s.")
+    
+    # print("Visualizing")
+    # analyzer.visualize_3d_interactive()
+    # print("finished visualizing")
 
 
 
@@ -126,7 +175,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--clustering_algo",
         type=str,
-        help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
+        help="The clustering algorithm to use. We employ HDBSCAN by default.",
         default="hdbscan"
     )
     parser.add_argument(
