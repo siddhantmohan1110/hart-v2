@@ -11,6 +11,7 @@ import copy
 import numpy as np
 import torchvision
 from PIL import Image
+import re
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
 from sklearn.cluster import KMeans
 import torch
@@ -170,31 +171,36 @@ def main(
 
         # Create a prompt for summarization
         prompts_text = "\n".join([f"- {p}" for p in topic_prompts[:100]])  # Limit to first 100 to avoid token limits
-        summarization_prompt = f"""Given the following list of image generation prompts, all of which describe visually related concepts, generate a SINGLE concise summary prompt that captures their shared visual characteristics.
+        summarization_prompt = f"""You are generating ONE text-to-image prompt to be used directly by an image generation model.
 
-The summary will be used directly as conditioning input to a text-to-image generation model. It must therefore be visually grounded, concrete, and optimized for generative reuse.
+Write the prompt as if you want the image to be generated, not described. Do NOT describe a list, do NOT mention prompts, summaries, clusters, or collections.
 
+Strictly avoid meta or generic phrasing such as:
+"collection", "various", "diverse", "depicting", "images", "visual similarity", "objects", "subject", "scene showing".
+
+Task:
+From the prompts below, infer the most plausible shared visual concept and write ONE concise, visually grounded image-generation prompt.
+        
 Guidelines:
-- Focus on shared visual attributes such as object category, shape, texture, material, color, typical pose or viewpoint, and common environment if applicable.
-- Capture only what is common across the prompts; ignore rare or class-specific details.
-- Do NOT list or reference individual class names or labels.
-- Do NOT mention that this is a summary, cluster, or aggregation.
+- Focus on concrete visual attributes: object type, shape, texture, material, color, typical pose or viewpoint, and a likely environment if applicable.
+- Capture what is common across the prompts; ignore rare, weak, or incoherent outliers.
+- If the prompts span unrelated categories, choose ONE dominant and visually distinctive subject and ignore the rest.
+- Do NOT list or reference individual class names.
 - Avoid abstract, symbolic, or non-visual language.
-- Avoid stylistic adjectives unless they are strongly implied by the cluster.
-- The output must be a single fluent natural-language prompt suitable for image generation.
+- Avoid stylistic adjectives unless clearly implied.
 
-Constraints:
-- Output length: 1-2 sentences only.
-- Output must not exceed 50 tokens.
-- Do not use bullet points, lists, or line breaks.
-- Do not include explanations, meta-commentary, or formatting.
-- Do not repeat the input prompts verbatim.
+Hard Constraints:
+- Output exactly ONE sentence.
+- Output must be 30 tokens or fewer.
+- No bullet points, lists, quotes, or line breaks.
+- No explanations or commentary.
 - Produce exactly ONE prompt and nothing else.
+- Strictly avoid meta or generic phrasing such as: "collection", "various", "diverse", "depicting", "images", "visual similarity", "objects", "subject", "scene showing".
 
 Prompts:
 {prompts_text}
 
-Summary prompt:"""
+Prompt:"""
 
         # Tokenize and generate summary
         inputs = qwen_tokenizer(summarization_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
@@ -246,16 +252,20 @@ Summary prompt:"""
 
     # Generate f_hats for each summary centroid with alpha=3
     fhat_centroids = {}
-    cluster_output_images = []
+    cluster_output_images = {}  # Changed to dict to maintain cluster_id association
     alpha = 3
     fhat_save_path = "./fhat_centroids"
     os.makedirs(fhat_save_path, exist_ok=True)
 
     print(f"\nGenerating f_hats for {len(summary_centroids)} cluster summaries with alpha={alpha}...")
 
+    # Sort cluster IDs to process in order
+    sorted_cluster_ids = sorted(summary_centroids.keys(), key=lambda x: int(x) if str(x).lstrip('-').isdigit() else float('inf'))
+
     with torch.inference_mode():
         with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
-            for topic_id, summary in summary_centroids.items():
+            for topic_id in sorted_cluster_ids:
+                summary = summary_centroids[topic_id]
                 print(f"Processing summary for cluster {topic_id}...")
 
                 # Encode the summary using the same function from sample.py
@@ -295,8 +305,8 @@ Summary prompt:"""
                     is_shared_hart=False,
                 )
 
-                # Store the output image for grid creation
-                cluster_output_images.append(output_imgs[0])
+                # Store the output image with cluster_id for ordered grid creation
+                cluster_output_images[topic_id] = output_imgs[0]
 
                 # Load the saved f_hat for this cluster
                 fhat_file = os.path.join(fhat_save_path, f'fhat_kv_stage_{alpha}.pt')
@@ -309,10 +319,11 @@ Summary prompt:"""
                 else:
                     print(f"Warning: f_hat file not found for cluster {topic_id}")
 
-    # Create and save grid image of all cluster centroids
+    # Create and save grid image of all cluster centroids in sorted order
     if cluster_output_images:
-        # Stack all images and create grid
-        cluster_images_tensor = torch.stack(cluster_output_images)
+        # Stack images in sorted order by cluster_id
+        sorted_images = [cluster_output_images[cid] for cid in sorted_cluster_ids]
+        cluster_images_tensor = torch.stack(sorted_images)
         grid = torchvision.utils.make_grid(cluster_images_tensor, nrow=min(8, len(cluster_output_images)))
         grid_np = grid.to(torch.float16).permute(1, 2, 0).mul_(255).cpu().numpy()
         grid_np = Image.fromarray(grid_np.astype(np.uint8))
@@ -320,6 +331,7 @@ Summary prompt:"""
         grid_save_path = "cluster_centroids_grid.png"
         grid_np.save(grid_save_path)
         print(f"\nSaved grid of {len(cluster_output_images)} cluster centroid images to {grid_save_path}")
+        print(f"Images ordered by cluster_id: {sorted_cluster_ids}")
 
     # Save all f_hat centroids
     torch.save(fhat_centroids, "fhat_centroids.pt")
