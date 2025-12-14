@@ -1,9 +1,8 @@
 default_prompts = [
-   "goldfish",
-    "bulbul",
-    "whiptail",
-    "hornbill",
-   
+    "goldfish",
+    "jack-o'-lantern",
+    "head cabbage",
+    "cauliflower",
 ]
 
 llm_system_prompt_old = """Given a user prompt, generate an "Enhanced prompt" that provides detailed visual descriptions suitable for image generation.

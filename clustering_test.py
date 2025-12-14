@@ -81,6 +81,101 @@ def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
     return all_embeddings
 
 
+def load_clip_embeddings(texts, model_name="openai/clip-vit-large-patch14-336", batch_size=32):
+    """Load CLIP ViT-L/14@336px model and generate text embeddings."""
+    from transformers import CLIPProcessor, CLIPModel
+    from torch.utils.data import Dataset, DataLoader
+
+    class TextDataset(Dataset):
+        def __init__(self, texts):
+            self.texts = texts
+
+        def __len__(self):
+            return len(self.texts)
+
+        def __getitem__(self, idx):
+            return self.texts[idx]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Loading CLIP model from {model_name}...")
+
+    processor = CLIPProcessor.from_pretrained(model_name)
+    model = CLIPModel.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
+
+    dataset = TextDataset(texts)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_embeddings = []
+    print(f"Generating embeddings for {len(texts)} texts using CLIP ViT-L/14@336px...")
+
+    with torch.no_grad():
+        for batch_texts in dataloader:
+            inputs = processor(text=list(batch_texts), return_tensors="pt", padding=True, truncation=True).to(device)
+            outputs = model.get_text_features(**inputs)
+            all_embeddings.append(outputs.cpu())
+
+    all_embeddings = torch.cat(all_embeddings, dim=0)
+    print(f"Generated embeddings with shape: {all_embeddings.shape}")
+
+    # Clean up
+    del model
+    del processor
+    torch.cuda.empty_cache()
+
+    return all_embeddings
+
+
+def load_qwen_embeddings(texts, model_name="Qwen2-VL-1.5B-Instruct/", batch_size=32):
+    """Load Qwen model and generate text embeddings from last hidden state."""
+    from torch.utils.data import Dataset, DataLoader
+
+    class TextDataset(Dataset):
+        def __init__(self, texts):
+            self.texts = texts
+
+        def __len__(self):
+            return len(self.texts)
+
+        def __getitem__(self, idx):
+            return self.texts[idx]
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Loading Qwen model from {model_name} for embeddings...")
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
+
+    dataset = TextDataset(texts)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_embeddings = []
+    print(f"Generating embeddings for {len(texts)} texts using Qwen...")
+
+    with torch.no_grad():
+        for batch_texts in dataloader:
+            inputs = tokenizer(list(batch_texts), return_tensors="pt", padding=True, truncation=True, max_length=512).to(device)
+            outputs = model(**inputs)
+            # Use mean pooling of last hidden state
+            hidden_states = outputs.last_hidden_state
+            attention_mask = inputs['attention_mask'].unsqueeze(-1)
+            embeddings = (hidden_states * attention_mask).sum(dim=1) / attention_mask.sum(dim=1)
+            all_embeddings.append(embeddings.cpu())
+
+    all_embeddings = torch.cat(all_embeddings, dim=0)
+    print(f"Generated embeddings with shape: {all_embeddings.shape}")
+
+    # Clean up
+    del model
+    del tokenizer
+    torch.cuda.empty_cache()
+
+    return all_embeddings
+
+
 # def clean_generated_summary(text):
 #     """Clean the generated summary text using regex patterns."""
 #     if not text or not text.strip():
@@ -145,14 +240,25 @@ def main(
         clustering_algo="hdbscan",
         batch_size=128,
         siglip_model="siglip",
+        embedding_model="siglip",
         **hdb_configs):
 
     if limit:
         prompts = prompts[:limit]
 
-    # Use SigLIP for clustering embeddings
-    print("Using SigLIP for generating clustering embeddings...")
-    embeddings = load_siglip_embeddings(prompts, model_name=siglip_model, batch_size=batch_size)
+    # Select embedding model for clustering
+    if embedding_model.lower() == "siglip":
+        print("Using SigLIP for generating clustering embeddings...")
+        embeddings = load_siglip_embeddings(prompts, model_name=siglip_model, batch_size=batch_size)
+    elif embedding_model.lower() == "clip":
+        print("Using CLIP ViT-L/14@336px for generating clustering embeddings...")
+        embeddings = load_clip_embeddings(prompts, model_name="openai/clip-vit-large-patch14-336", batch_size=batch_size)
+    elif embedding_model.lower() == "qwen":
+        print("Using Qwen for generating clustering embeddings...")
+        embeddings = load_qwen_embeddings(prompts, model_name=text_model_path, batch_size=batch_size)
+    else:
+        raise ValueError(f"Unknown embedding model: {embedding_model}. Choose from: siglip, clip, qwen")
+
     np_embed = embeddings.cpu().numpy()
     del embeddings
     torch.cuda.empty_cache()
@@ -229,6 +335,36 @@ def main(
 
         # Create a prompt for summarization
         prompts_text = "\n".join([f"- {p}" for p in topic_prompts[:100]])  # Limit to first 100 to avoid token limits
+    #     summarization_prompt = f"""
+    # You are an expert visual prompt engineer for the HART (Hybrid Autoregressive Transformer) image generation model. Your goal is to convert short, ambiguous ImageNet class labels into rich, unambiguous, photorealistic visual descriptions.
+
+    # CRITICAL INSTRUCTION:
+    # The input labels come from the ImageNet dataset, which is based on the WordNet hierarchy. You must ALWAYS prioritize the WordNet definition of the object.
+    # - If the label is "Black Widow", you must describe the spider (Latrodectus), NEVER the Marvel character.
+    # - If the label is "Crane", you must check the context or provide a specific description of the bird (Gruidae) or the construction machine, but default to the most common ImageNet biological class if unsure, or specify the biological distinctiveness.
+    # - If the label is "Jaguar", describe the cat (Panthera onca), not the car (unless specified).
+
+    # Your output format for every label must be:
+    # [Subject Description] + [Environment/Context] + [Lighting/Style] 
+
+    # GUIDELINES:
+    # 1. Subject: Explicitly describe the visual features (color, texture, shape). Use scientific names if helpful for clarity.
+    # 2. Context: Place the object in its natural habitat or typical setting.
+    # 3. Style: Use high-quality keywords (4k, detailed texture, cinematic lighting) to ensure HART generates a high-fidelity image.
+    # 4. Output: Provide ONLY the final prompt text. Do not output conversational filler like "Here is the prompt." 
+    # 5. Output must be 40 tokens or fewer
+
+    # Example Input: "Black Widow"
+    # Example Output: A close-up macro photograph of a Latrodectus spider, commonly known as a black widow, featuring a shiny black bulbous abdomen with a distinctive red hourglass marking. The spider is resting on a chaotic silk web in a dark, shadowy corner. Natural lighting, high contrast, 8k resolution, photorealistic texture.
+
+    # Input: {prompts_text}
+    # Output: 
+    # """ 
+
+        
+        
+        
+        
         summarization_prompt = f"""You are generating ONE text-to-image prompt to be used directly by an image generation model.
 
 Write the prompt as if you want the image to be generated, not described. Do NOT describe a list, do NOT mention prompts, summaries, clusters, or collections.
@@ -500,7 +636,7 @@ if __name__ == "__main__":
         "--clustering_algo",
         type=str,
         help="The clustering algorithm to use: hdbscan, kmeans, or agglomerative. We employ HDBSCAN by default.",
-        default="hdbscan"
+        default="agglomerative"
     )
     parser.add_argument(
         "--n_clusters",
@@ -519,6 +655,13 @@ if __name__ == "__main__":
         type=str,
         help="The SigLIP model to use for clustering embeddings.",
         default="siglip",
+    )
+    parser.add_argument(
+        "--embedding_model",
+        type=str,
+        help="The embedding model for clustering: siglip, clip (ViT-L/14@336px), or qwen.",
+        default="siglip",
+        choices=["siglip", "clip", "qwen"],
     )
     parser.add_argument(
         "--model_path",
@@ -565,7 +708,7 @@ if __name__ == "__main__":
 
     text_model_path = args.text_model_path
     hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    main(prompts, text_model_path, args, limit = None, clustering_algo=clustering_algo, batch_size=128, siglip_model=args.siglip_model, **hdb_config)
+    main(prompts, text_model_path, args, limit = None, clustering_algo=clustering_algo, batch_size=128, siglip_model=args.siglip_model, embedding_model=args.embedding_model, **hdb_config)
     # test_BertTopic(prompts, text_model_path)
 
     # test_TTV(prompts)

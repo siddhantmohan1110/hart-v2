@@ -115,8 +115,10 @@ def main(args):
     # Use path relative to script location (one directory up from hart-v2/)
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
     FHAT_CENTROIDS_PATH = os.path.join(SCRIPT_DIR, "..", "fhat_centroids.pt")
-    # Default to cluster_id 14 if not specified
-    cluster_ids = args.cluster_ids if args.cluster_ids is not None else [14] * len(prompts)
+    # Convert cluster_ids to list if it's a single integer
+    cluster_ids = args.cluster_ids
+    if isinstance(cluster_ids, int):
+        cluster_ids = [cluster_ids] * len(prompts)
     shared_state_cache = None
 
     if os.path.exists(FHAT_CENTROIDS_PATH):
@@ -251,7 +253,7 @@ if __name__ == "__main__":
         nargs='+',
         type=int,
         help="Cluster IDs to use f_hats from fhat_centroids.pt (one per prompt, space-separated)",
-        default=None,
+        default=36,
     )
     args = parser.parse_args()
 
