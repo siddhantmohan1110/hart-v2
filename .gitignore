@@ -167,3 +167,6 @@ wandb/
 wandb/*
 
 __pycache__/
+
+# Generated artifacts
+cluster_centroids_grid.png

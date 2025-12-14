@@ -60,7 +60,8 @@ class BERTopicAnalyzer:
     A class to perform topic modeling using BERTopic with visualization capabilities.
     """
     
-    def __init__(self, clustering_model, documents=None, min_topic_size=10, n_components=3, embeddings = None):
+    def __init__(self, clustering_model, documents=None, min_topic_size=10,
+     n_components=3, embeddings = None, embedding_model = None):
         """
         Initialize the BERTopic analyzer.
         
@@ -81,6 +82,8 @@ class BERTopicAnalyzer:
         self.probabilities = None
         self.embeddings = None
         self.clustering_model = clustering_model
+        self.embedding_model = embedding_model
+        print("docs", self.documents)
         # self.representation_model = representation_model
 
     @staticmethod
@@ -125,18 +128,35 @@ class BERTopicAnalyzer:
         hdbscan_model = self.clustering_model
         
         # Initialize BERTopic with custom UMAP
-        self.topic_model = BERTopic(
-            # representation_model=representation_model,
-            umap_model=umap_model,
-            hdbscan_model=hdbscan_model,
-            min_topic_size=self.min_topic_size,
-            verbose=True,
-            calculate_probabilities=True,
-            vectorizer_model=vectorizer_model, 
-            # nr_topics="auto"
-        )
+        if embeddings is None and self.embedding_model:
+
+            self.topic_model = BERTopic(
+                embedding_model=self.embedding_model,
+                umap_model=umap_model,
+                hdbscan_model=hdbscan_model,
+                min_topic_size=self.min_topic_size,
+                verbose=True,
+                calculate_probabilities=True,
+                vectorizer_model=vectorizer_model, 
+                nr_topics="auto"
+            )
+        
+        elif embeddings:
+            self.topic_model = BERTopic( 
+                umap_model=umap_model,
+                hdbscan_model=hdbscan_model,
+                min_topic_size=self.min_topic_size,
+                verbose=True,
+                calculate_probabilities=True,
+                vectorizer_model=vectorizer_model, 
+            )
+        else: 
+            raise Exception("Either an embedding model or a Embedding list must be provided")
+
+        print(f"documents: {documents}")
 
         if documents is None: 
+            print(self.documents)
             documents = self.documents
 
         if not documents: 
