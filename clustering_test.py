@@ -13,7 +13,7 @@ import torchvision
 from PIL import Image
 import re
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, AgglomerativeClustering
 import torch
 
 # from cuml.cluster import HDBSCAN
@@ -35,94 +35,130 @@ from transformers import (
 from hart.modules.models.transformer import HARTForT2I
 
 
-# def test_TTV(prompts):
-#     ttv = Topic2VecClustering()
-#     ttv.init_model(prompts)
-#     # Simplified version
-#     fig_simple = ttv.plot_interactive_with_centroids(
-#         file_name="simple_centroids_0_05_dist",
-#         save_path="./",
-#         show_fig=True
-#     )
+def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
+    """Load SigLIP model and generate text embeddings."""
+    from transformers import AutoProcessor, AutoModel
+    from torch.utils.data import Dataset, DataLoader
 
+    class TextDataset(Dataset):
+        def __init__(self, texts):
+            self.texts = texts
 
-def test_BertTopic(prompts, text_model_path, limit=10**5):
+        def __len__(self):
+            return len(self.texts)
 
-    if limit: 
-        prompts = prompts[:limit]
+        def __getitem__(self, idx):
+            return self.texts[idx]
 
-    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Loading SigLIP model from {model_name}...")
 
-    for idx, prompt in enumerate(prompts):
-        prompts[idx] = base_prompt + " " + prompt
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+    model = model.to(device)
+    model.eval()
 
-    embeddings = load_qwen(prompts, text_model_path, batch_size=128)
-    np_embed = embeddings.cpu().numpy()
-    del embeddings
+    dataset = TextDataset(texts)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+
+    all_embeddings = []
+    print(f"Generating embeddings for {len(texts)} texts using SigLIP...")
+
+    with torch.no_grad():
+        for batch_texts in dataloader:
+            inputs = processor(text=batch_texts, return_tensors="pt", padding=True, truncation=True).to(device)
+            outputs = model.get_text_features(**inputs)
+            all_embeddings.append(outputs.cpu())
+
+    all_embeddings = torch.cat(all_embeddings, dim=0)
+    print(f"Generated embeddings with shape: {all_embeddings.shape}")
+
+    # Clean up
+    del model
+    del processor
     torch.cuda.empty_cache()
 
-    if limit: 
-        prompts = prompts[:limit]
-
-    base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
-
-    for idx, prompt in enumerate(prompts):
-        prompts[idx] = base_prompt + " " + prompt
-
-    embeddings = load_qwen(prompts, text_model_path, batch_size=128)
-    np_embed = embeddings.cpu().numpy()
-    del embeddings
-    torch.cuda.empty_cache()
+    return all_embeddings
 
 
-    if limit: 
-        prompts = prompts[:limit]
+# def clean_generated_summary(text):
+#     """Clean the generated summary text using regex patterns."""
+#     if not text or not text.strip():
+#         return ""
 
-    hdbscan = HDBSCAN(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    kmeans = KMeans(n_clusters=50)
+#     # Remove quotes at the beginning and end
+#     text = re.sub(r'^[\"\']|[\"\']$', '', text.strip())
 
-    for cls in [hdbscan, kmeans]:
-        start = time()
-        analyzer = BERTopicAnalyzer(clustering_model=cls, min_topic_size=3, n_components=3)
+#     # Remove meta-phrases and artifacts
+#     meta_patterns = [
+#         r'^(Summary|Prompt|Output|Answer):\s*',
+#         r'\n+(Summary|Prompt|Output|Answer):\s*.*$',
+#         r'To generate this image.*$',
+#         r'Create a (detailed )?image of.*$',
+#         r'The image should.*$',
+#         r'From these prompts.*$',
+#         r'In summary.*$',
+#         r'This prompt.*$',
+#         r'Please provide.*$',
+#         r'Based on.*$',
+#     ]
 
-            # Choose data source (comment/uncomment as needed)
-        # Option 1: Use custom documents
-        # analyzer.create_custom_documents()
-        read_time = time()
-        analyzer.fit_model(prompts, np_embed)
+#     for pattern in meta_patterns:
+#         text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.MULTILINE)
 
-        # Option 2: Load from 20 newsgroups (uncomment to use)
-        # analyzer.load_sample_data(n_samples=500)
+#     # Remove repetitive patterns (like "apiary -> apiary" repeated)
+#     text = re.sub(r'(\b\w+\b)(\s*->\s*\1){3,}', r'\1', text)
 
-        # Option 3: Use your own documents (uncomment and modify)
-        # analyzer.load_data()
-        # analyzer.documents = your_documents
+#     # Remove numbered lists at the beginning
+#     text = re.sub(r'^\d+\.\s+', '', text)
 
-        # Fit the model
-        # analyzer.fit_model()
-        end = time()
-        print(f"Total Time = {end - start}")
-        print(f"Input reading IO time = {read_time - start}")
+#     # Remove extra whitespace and newlines
+#     text = re.sub(r'\n+', ' ', text)
+#     text = re.sub(r'\s+', ' ', text)
+
+#     # Extract first sentence if text is too long or contains multiple sentences
+#     sentences = re.split(r'[.!?]\s+', text)
+#     if sentences:
+#         text = sentences[0].strip()
+#         # Add period if not present
+#         if text and not text[-1] in '.!?':
+#             text += '.'
+
+#     # Remove trailing incomplete sentences or artifacts
+#     text = re.sub(r'\s+(and|or|with|in|on|at|the|a)\s*\.?$', '.', text, flags=re.IGNORECASE)
+
+#     # Final cleanup
+#     text = text.strip()
+
+#     # If still empty or too short, return a generic fallback
+#     if len(text) < 3:
+#         return ""
+
+#     return text
 
 
 def main(
         prompts,
         text_model_path,
+        args,
         limit=10**5,
         clustering_algo="hdbscan",
         batch_size=128,
+        siglip_model="siglip",
         **hdb_configs):
 
-    if limit: 
+    if limit:
         prompts = prompts[:limit]
 
-    embeddings = load_qwen(prompts, text_model_path, batch_size=batch_size)
+    # Use SigLIP for clustering embeddings
+    print("Using SigLIP for generating clustering embeddings...")
+    embeddings = load_siglip_embeddings(prompts, model_name=siglip_model, batch_size=batch_size)
     np_embed = embeddings.cpu().numpy()
     del embeddings
     torch.cuda.empty_cache()
 
 
-    if limit: 
+    if limit:
         prompts = prompts[:limit]
 
     #base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
@@ -131,11 +167,14 @@ def main(
 
     if clustering_algo.lower() == "hdbscan":
         algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    
+    elif clustering_algo.lower() == "kmeans":
+        print(f"Starting KMeans with {args.n_clusters} clusters")
+        algo = KMeans(n_clusters=args.n_clusters)
+    elif clustering_algo.lower() == "agglomerative":
+        print(f"Starting Agglomerative Clustering with {args.n_clusters} clusters")
+        algo = AgglomerativeClustering(n_clusters=args.n_clusters, linkage='ward')
     else:
-        print(f"Provided algo is: {clustering_algo.lower()}")
-        print(f"Starting Kmeans")
-        algo = KMeans(n_clusters=100) # For Kmeans. 
+        raise ValueError(f"Unknown clustering algorithm: {clustering_algo}. Choose from: hdbscan, kmeans, agglomerative") 
 
     start = time()
     analyzer = BERTopicAnalyzer(clustering_model=algo, min_topic_size=3, n_components=3)
@@ -166,6 +205,12 @@ def main(
         cluster_prompts[topic_id].append(prompts[doc_idx])
 
     print(f"Found {len(cluster_prompts)} clusters")
+
+    # Save cluster prompts to file
+    cluster_prompts_serializable = {str(k): v for k, v in cluster_prompts.items()}
+    with open("cluster_prompts.json", "w") as f:
+        json.dump(cluster_prompts_serializable, f, indent=2)
+    print(f"Saved prompts for {len(cluster_prompts)} clusters to cluster_prompts.json")
 
     # Load qwen model for summarization
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -267,7 +312,6 @@ Prompt:"""
         summary = " ".join(summary.split()).strip("., ")
 
         summary_centroids[topic_id] = summary
-        print(f"Cluster {topic_id} summary: {summary[:100]}...")
 
     # Merge clusters that ended up with identical cleaned summaries.
     summary_key_map = {}
@@ -313,7 +357,8 @@ Prompt:"""
             torch.load(os.path.join(args.model_path, "ema_model.bin"))
         )
 
-    # Load text model for encoding summaries
+    # Load Qwen text model for encoding summaries for HART forward pass
+    print("\nLoading Qwen model for HART text embeddings...")
     hart_text_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
     hart_text_model = AutoModel.from_pretrained(text_model_path).to(device)
     hart_text_model.eval()
@@ -436,14 +481,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--clustering_algo",
         type=str,
-        help="The clustering algorithm to use. We employ HDBSCAN by default.",
+        help="The clustering algorithm to use: hdbscan, kmeans, or agglomerative. We employ HDBSCAN by default.",
         default="hdbscan"
+    )
+    parser.add_argument(
+        "--n_clusters",
+        type=int,
+        help="Number of clusters for KMeans or Agglomerative Clustering (not used for HDBSCAN).",
+        default=100
     )
     parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
         default="Qwen2-VL-1.5B-Instruct/",
+    )
+    parser.add_argument(
+        "--siglip_model",
+        type=str,
+        help="The SigLIP model to use for clustering embeddings.",
+        default="siglip",
     )
     parser.add_argument(
         "--model_path",
@@ -490,7 +547,7 @@ if __name__ == "__main__":
 
     text_model_path = args.text_model_path
     hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    main(prompts, text_model_path, limit = None, clustering_algo=clustering_algo, batch_size=128, **hdb_config)
+    main(prompts, text_model_path, args, limit = None, clustering_algo=clustering_algo, batch_size=128, siglip_model=args.siglip_model, **hdb_config)
     # test_BertTopic(prompts, text_model_path)
 
     # test_TTV(prompts)
