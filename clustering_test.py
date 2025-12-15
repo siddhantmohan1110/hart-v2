@@ -601,10 +601,10 @@ def main(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--mjhq-meta-path",
+        "--mjhq-metadata-path",
         type=str,
         help="The path to MJHQ meta_data.json.",
-        default="./MJHQ-30K/meta_data.json",    
+        default="./../data/MJHQ-30K/meta_data.json",    
     )
 
     parser.add_argument(
@@ -623,13 +623,13 @@ if __name__ == "__main__":
         "--text_model_path",
         type=str,
         help="Model path to use for HART text embeddings, HART employs Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct/",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
     )
     parser.add_argument(
         "--summarizer_model_path",
         type=str,
         help="Model path to use for summarization/rich prompt generation.",
-        default="Qwen2-VL-1.5B-Instruct/",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
     )
     parser.add_argument(
         "--experiment_name",
@@ -648,7 +648,7 @@ if __name__ == "__main__":
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="hart-0.7b-1024px/llm",
+        default="./../saved_models/hart-0.7b-1024px/llm",
     )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--use_ema", type=bool, default=True)
@@ -694,10 +694,16 @@ if __name__ == "__main__":
         help="Batch size for embedding generation.",
         default=128,
     )
+    parser.add_argument(
+        "--imagenet_class_labels_path",
+        type=int,
+        help="Path to ImageNet class labels",
+        default="./../data/ImageNet/imagenet_classes.txt",
+    )
 
     args = parser.parse_args()
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
-    with open("data/imagenet_classes.txt") as f:
+    with open(args.imagenet_class_labels_path) as f:
         imagenet_labels = [x.strip() for x in f.readlines()]
    
     prompts = imagenet_labels
