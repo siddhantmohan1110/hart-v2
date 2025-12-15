@@ -266,7 +266,7 @@ def summarize_clusters(
 
 def generate_rich_prompts(
     prompts,
-    text_model_path,
+    enrichment_model_path,
     batch_size=8,
     max_new_tokens=80,
     temperature=0.2,
@@ -274,9 +274,9 @@ def generate_rich_prompts(
     timings=None,
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained(text_model_path, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(enrichment_model_path, padding_side="left")
     model = AutoModelForCausalLM.from_pretrained(
-        text_model_path,
+        enrichment_model_path,
         torch_dtype=torch.float16,
         device_map="auto",
     )
@@ -322,11 +322,8 @@ def generate_rich_prompts(
     return enriched
 
 
-def main(
-        prompts,
-        args,
-        limit=10**5,
-        **hdb_configs):
+def main(args):
+
     overall_start = time()
     timings = {
         "meta": {
@@ -343,15 +340,21 @@ def main(
     summary_centroids_path = os.path.join(output_dir, "summary_centroids.json")
     fhat_centroids_path = os.path.join(output_dir, "fhat_centroids.pt")
     cluster_grid_path = os.path.join(output_dir, "cluster_centroids_grid.png")
-    timing_output_path = args.timing_output_path or os.path.join(output_dir, "timing_profile.json")
+    timing_output_path = os.path.join(output_dir, "timing_profile.json")
 
+    enrichment_model_path = args.enrichment_model_path
     embedding_model=args.embedding_model
-    text_model_path=args.text_model_path
     summarizer_model_path=args.summarizer_model_path
     clustering_algo=args.clustering_algo
+    text_model_path=args.text_model_path
 
-    if limit:
-        prompts = prompts[:limit]
+    if args.dataset.lower() == "mjhq":
+        prompts = load_mjhq(args.mjhq_metadata_path)
+    elif args.dataset.lower() == "imagenet":
+        with open(args.imagenet_class_labels_path) as f:
+            prompts = [x.strip() for x in f.readlines()]
+    else:
+        raise ValueError(f"Unknown dataset: {args.dataset}. Choose from: imagenet, mjhq")
 
     timings["meta"]["prompt_count"] = len(prompts)
 
@@ -359,7 +362,7 @@ def main(
         enrich_start = time()
         prompts = generate_rich_prompts(
             prompts,
-            summarizer_model_path,
+            enrichment_model_path,
             batch_size=getattr(args, "enrichment_batch_size"),
             timings=timings,
         )
@@ -381,17 +384,14 @@ def main(
     del embeddings
     torch.cuda.empty_cache()
 
-
-    if limit:
-        prompts = prompts[:limit]
-
     #base_prompt = "You are given a label from ImageNet Classification Dataset. Some labels like Black widow might be ambiguous. Infer to the right meaning from ImageNet class label and generate the image prompt describing the correct visual attributes of the label.\n Label:" 
     for idx, prompt in enumerate(prompts):
         prompts[idx] =  prompt
 
     clustering_init_start = time()
     if clustering_algo.lower() == "hdbscan":
-        algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
+        hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
+        algo = HDBSCAN(**hdb_config) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
     elif clustering_algo.lower() == "kmeans":
         algo = KMeans(n_clusters=args.n_clusters)
     elif clustering_algo.lower() == "agglomerative":
@@ -600,49 +600,107 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    # ***********************************************************
+    # Dataset
+    # ***********************************************************
+    parser.add_argument(
+        "--imagenet_class_labels_path",
+        type=str,
+        help="Path to ImageNet class labels",
+        default="./../data/ImageNet/imagenet_classes.txt",
+    )
     parser.add_argument(
         "--mjhq-metadata-path",
         type=str,
         help="The path to MJHQ meta_data.json.",
-        default="./../data/MJHQ-30K/meta_data.json",    
+        default="./../data/MJHQ-30K/meta_data.json",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        help="Prompt dataset to use: imagenet or mjhq",
+        default="imagenet",
     )
 
+    # ***********************************************************
+    # Prompt enrichment
+    # ***********************************************************
     parser.add_argument(
-        "--clustering_algo",
-        type=str,
-        help="The clustering algorithm to use: hdbscan, kmeans, or agglomerative. We employ HDBSCAN by default.",
-        default="agglomerative"
+        "--enrich_prompts",
+        action="store_true",
+        help="Enrich ImageNet labels into richer visual descriptions before clustering.",
     )
     parser.add_argument(
-        "--n_clusters",
+        "--enrichment_model_path",
+        type=str,
+        help="Model path to use for rich prompt generation.",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
+    )
+    parser.add_argument(
+        "--enrichment_batch_size",
         type=int,
-        help="Number of clusters for KMeans or Agglomerative Clustering (not used for HDBSCAN).",
-        default=100
+        help="Batch size for prompt enrichment.",
+        default=8,
     )
-    parser.add_argument(
-        "--text_model_path",
-        type=str,
-        help="Model path to use for HART text embeddings, HART employs Qwen2-VL-1.5B-Instruct by default.",
-        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
-    )
-    parser.add_argument(
-        "--summarizer_model_path",
-        type=str,
-        help="Model path to use for summarization/rich prompt generation.",
-        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
-    )
-    parser.add_argument(
-        "--experiment_name",
-        type=str,
-        help="Directory name where outputs (jsons/images) for this run will be stored.",
-        default="experiment_run",
-    )
+
+    # ***********************************************************
+    # Pre-clustering prompt embedding
+    # ***********************************************************
     parser.add_argument(
         "--embedding_model",
         type=str,
         help="The embedding model for clustering: siglip, clip (ViT-L/14@336px), or qwen.",
         default="clip",
         choices=["siglip", "clip", "qwen"],
+    )
+    parser.add_argument(
+        "--embedding_batch_size",
+        type=int,
+        help="Batch size for embedding generation.",
+        default=128,
+    )
+
+    # ***********************************************************
+    # Clustering of prompts
+    # ***********************************************************
+    parser.add_argument(
+        "--clustering_algo",
+        type=str,
+        help="The clustering algorithm to use: hdbscan, kmeans, or agglomerative. We employ HDBSCAN by default.",
+        default="agglomerative",
+    )
+    parser.add_argument(
+        "--n_clusters",
+        type=int,
+        help="Number of clusters for KMeans or Agglomerative Clustering (not used for HDBSCAN).",
+        default=100,
+    )
+
+    # ***********************************************************
+    # Summarization of clusters
+    # ***********************************************************
+    parser.add_argument(
+        "--summarizer_model_path",
+        type=str,
+        help="Model path to use for summarization.",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
+    )
+    parser.add_argument(
+        "--max_prompts_per_cluster",
+        type=int,
+        help="Maximum prompts per cluster to include in the summarization prompt.",
+        default=100,
+    )
+    
+    # ***********************************************************
+    # HART
+    # ***********************************************************
+    parser.add_argument(
+        "--text_model_path",
+        type=str,
+        help="Model path to use for HART text embeddings, HART employs Qwen2-VL-1.5B-Instruct by default.",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
     )
     parser.add_argument(
         "--model_path",
@@ -655,12 +713,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_token_length", type=int, default=300)
     parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
     parser.add_argument(
-        "--max_prompts_per_cluster",
-        type=int,
-        help="Maximum prompts per cluster to include in the summarization prompt.",
-        default=100,
-    )
-    parser.add_argument(
         "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
     )
     parser.add_argument(
@@ -670,51 +722,21 @@ if __name__ == "__main__":
         default=True,
     )
 
-    parser.add_argument("--stop_with_centroid_summaries", action="store_true", help="If set, the program will stop after generating centroid summaries.")
+    # ***********************************************************
+    # Output / bookkeeping
+    # ***********************************************************
     parser.add_argument(
-        "--timing_output_path",
+        "--experiment_name",
         type=str,
-        help="Where to write profiling/timing information as JSON.",
-        default="timing_profile.json",
+        help="Directory name where outputs (jsons/images) for this run will be stored.",
+        default="exp1",
     )
     parser.add_argument(
-        "--enrich_prompts",
+        "--stop_with_centroid_summaries",
         action="store_true",
-        help="Enrich ImageNet labels into richer visual descriptions before clustering.",
-    )
-    parser.add_argument(
-        "--enrichment_batch_size",
-        type=int,
-        help="Batch size for prompt enrichment.",
-        default=8,
-    )
-    parser.add_argument(
-        "--embedding_batch_size",
-        type=int,
-        help="Batch size for embedding generation.",
-        default=128,
-    )
-    parser.add_argument(
-        "--imagenet_class_labels_path",
-        type=int,
-        help="Path to ImageNet class labels",
-        default="./../data/ImageNet/imagenet_classes.txt",
+        help="If set, the program will stop after generating centroid summaries.",
     )
 
     args = parser.parse_args()
-    # prompts = load_mjhq(args.get('mjhq-meta-path'))
-    with open(args.imagenet_class_labels_path) as f:
-        imagenet_labels = [x.strip() for x in f.readlines()]
-   
-    prompts = imagenet_labels
 
-    hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    main(
-        prompts,
-        args,
-        limit=None,
-        **hdb_config,
-    )
-    # test_BertTopic(prompts, text_model_path)
-
-    # test_TTV(prompts)
+    main(args)
