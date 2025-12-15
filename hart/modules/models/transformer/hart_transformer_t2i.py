@@ -319,7 +319,9 @@ class HARTForT2I(PreTrainedModel):
         save_fhat_path: str = './fhat_images',
         is_shared_hart: bool = False,
         shared_state: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
+        return_fhat: bool = False,
+        stop_after_fhat: bool = False,
+    ) -> Union[torch.Tensor, Tuple[Optional[torch.Tensor], torch.Tensor]]:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
         :param B: batch size
@@ -387,7 +389,6 @@ class HARTForT2I(PreTrainedModel):
         for b in self.blocks:
             b.attn.kv_caching(True)
 
-                    # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
         cond_BD_or_gss = self.shared_ada_lin(cond_BD)
 
         for si, pn in enumerate(self.patch_nums[:-1]):  # si: i-th segment
@@ -402,7 +403,8 @@ class HARTForT2I(PreTrainedModel):
             if is_shared_hart:
                 if si <= alpha:
                     continue
-                elif si == alpha+1: # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
+                elif si == alpha+1: 
+                    # Try to pass the token_map for current prompts by making it dimensional compatible using the same method but directly going to pn*pn instead of from scratch.
                     # state = torch.load(os.path.join(shared_hart_path, f'fhat_kv_stage_{si-1}.pt'), map_location=get_device()) # For now keeping the kv cache from centroid 
                     # f_hat = state["f_hat"].to(get_device()) 
                     # for blk, layer_state in zip(self.blocks, state["layers"]):
@@ -529,13 +531,21 @@ class HARTForT2I(PreTrainedModel):
             next_token_map = next_token_map.repeat(
                 2, 1, 1
             )  # double the batch sizes due to CFG
-            if save_fhat and si == alpha:
-                os.makedirs(save_fhat_path, exist_ok=True)
-                share_state = {
-                    "f_hat": f_hat.detach().cpu(),
-                    # "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
-                    }
-                torch.save(share_state, os.path.join(save_fhat_path, f'fhat_kv_stage_{si}.pt'))
+            if si == alpha:
+                if save_fhat and save_fhat_path:
+                    os.makedirs(save_fhat_path, exist_ok=True)
+                    share_state = {
+                        "f_hat": f_hat.detach().cpu(),
+                        # "layers": [{"k": blk.attn.cached_k.detach().cpu(),"v": blk.attn.cached_v.detach().cpu(),}for blk in self.blocks],
+                        }
+                    torch.save(share_state, os.path.join(save_fhat_path, f'fhat_kv_stage_{si}.pt'))
+
+                if stop_after_fhat:
+                    for b in self.blocks:
+                        b.attn.kv_caching(False)
+                    if return_fhat:
+                        return None, f_hat.detach()
+                    return None
 
         ################ last stage maskgit ################
         si = len(self.patch_nums) - 1
@@ -629,9 +639,11 @@ class HARTForT2I(PreTrainedModel):
 
         for b in self.blocks:
             b.attn.kv_caching(False)
-        return (
-            self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
-        )  # de-normalize, from [-1, 1] to [0, 1]
+        output_imgs = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)
+        # Optionally return f_hat for downstream consumers (e.g., clustering_test).
+        if return_fhat and alpha is not None and not is_shared_hart:
+            return output_imgs, f_hat.detach()
+        return output_imgs  # de-normalize, from [-1, 1] to [0, 1]
 
     def sample_orders(self, bsz):
         # generate a batch of random generation orders

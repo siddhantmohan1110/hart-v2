@@ -12,7 +12,7 @@ import numpy as np
 import torchvision
 from PIL import Image
 import re
-from hart.utils import encode_prompts, default_prompts, llm_system_prompt, safety_check
+from hart.utils import encode_prompts
 from sklearn.cluster import KMeans, AgglomerativeClustering
 import torch
 
@@ -20,7 +20,7 @@ import torch
 from hdbscan import HDBSCAN
 
 # from hart.clustering import Topic2VecClustering
-from hart.clustering.algos.bert_topic import BERTopicAnalyzer, load_qwen
+from hart.clustering.algos.bert_topic import BERTopicAnalyzer
 from hart.utils.datasets import load_mjhq
 
 from transformers import (
@@ -32,7 +32,6 @@ from transformers import (
     set_seed,
 )
 
-from hart.modules.models.transformer import HARTForT2I
 from hart.utils.constants import (
     summarization_prompt_template,
     enrichment_prompt_template,
@@ -336,11 +335,12 @@ def main(args):
     }
     output_dir = args.experiment_name
     os.makedirs(output_dir, exist_ok=True)
-    cluster_prompts_path = os.path.join(output_dir, "cluster_prompts.json")
-    summary_centroids_path = os.path.join(output_dir, "summary_centroids.json")
-    fhat_centroids_path = os.path.join(output_dir, "fhat_centroids.pt")
-    cluster_grid_path = os.path.join(output_dir, "cluster_centroids_grid.png")
-    timing_output_path = os.path.join(output_dir, "timing_profile.json")
+    experiment_prefix = args.experiment_name
+    cluster_prompts_path = os.path.join(output_dir, f"{experiment_prefix}_cluster_prompts.json")
+    summary_centroids_path = os.path.join(output_dir, f"{experiment_prefix}_summary_centroids.json")
+    fhat_centroids_path = os.path.join(output_dir, f"{experiment_prefix}_fhat_centroids.pt")
+    cluster_grid_path = os.path.join(output_dir, f"{experiment_prefix}_cluster_centroids_grid.png")
+    timing_output_path = os.path.join(output_dir, f"{experiment_prefix}_timing_profile.json")
 
     enrichment_model_path = args.enrichment_model_path
     embedding_model=args.embedding_model
@@ -484,9 +484,8 @@ def main(args):
     # Generate f_hats for each summary centroid with alpha=3
     fhat_centroids = {}
     cluster_output_images = {}  # Changed to dict to maintain cluster_id association
-    alpha = 3
-    fhat_save_path = os.path.join(output_dir, "fhat_centroids")
-    os.makedirs(fhat_save_path, exist_ok=True)
+    alpha = args.alpha
+    stop_after_fhat = not getattr(args, "generate_centroid_grid", False)
 
     fhat_generation_start = time()
     fhat_cluster_timings = {}
@@ -522,8 +521,8 @@ def main(args):
                     else hart_model.autoregressive_infer_cfg
                 )
 
-                # Forward pass through HART with save_fhat=True and alpha=3
-                output_imgs = infer_func(
+                # Forward pass through HART to get f_hat
+                output_imgs, f_hat = infer_func(
                     B=context_tensor.size(0),
                     label_B=context_tensor,
                     cfg=args.cfg,
@@ -531,22 +530,18 @@ def main(args):
                     more_smooth=args.more_smooth,
                     context_position_ids=context_position_ids,
                     context_mask=context_mask,
-                    save_fhat=True,
-                    save_fhat_path=fhat_save_path,
                     alpha=alpha,
                     is_shared_hart=False,
+                    return_fhat=True,
+                    stop_after_fhat=stop_after_fhat,
                 )
 
                 # Store the output image with cluster_id for ordered grid creation
-                cluster_output_images[topic_id] = output_imgs[0]
+                if output_imgs is not None:
+                    cluster_output_images[topic_id] = output_imgs[0]
 
-                # Load the saved f_hat for this cluster
-                fhat_file = os.path.join(fhat_save_path, f'fhat_kv_stage_{alpha}.pt')
-                if os.path.exists(fhat_file):
-                    fhat_data = torch.load(fhat_file)
-                    fhat_centroids[topic_id] = fhat_data['f_hat']
-                    # Clean up the temporary file
-                    os.remove(fhat_file)
+                # Capture the returned f_hat directly instead of reloading from disk
+                fhat_centroids[topic_id] = f_hat.detach().cpu()
                 fhat_cluster_timings[str(topic_id)] = time() - cluster_gen_start
 
     timings["fhat_generation"] = {
@@ -556,7 +551,7 @@ def main(args):
 
     # Create and save grid image of all cluster centroids in sorted order
     grid_time_start = time()
-    if cluster_output_images:
+    if args.generate_centroid_grid and cluster_output_images:
         # Stack images in sorted order by cluster_id
         sorted_images = [cluster_output_images[cid] for cid in sorted_cluster_ids]
         cluster_images_tensor = torch.stack(sorted_images)
@@ -570,8 +565,10 @@ def main(args):
             "cluster_id_order": sorted_cluster_ids,
             "save_sec": time() - grid_time_start,
         }
-    else:
+    elif args.generate_centroid_grid:
         timings["cluster_grid"] = {"save_sec": time() - grid_time_start, "cluster_id_order": []}
+    else:
+        timings["cluster_grid"] = {"skipped": True, "save_sec": time() - grid_time_start, "cluster_id_order": []}
 
     # Save all f_hat centroids
     fhat_save_start = time()
@@ -721,6 +718,12 @@ if __name__ == "__main__":
         help="Turn on for more visually smooth samples.",
         default=True,
     )
+    parser.add_argument(
+        "--alpha",
+        type=int,
+        help="Stage index up to which shared HART is used. For example, alpha=3 means stages 0,1,2,3 use shared HART while stages 4+ use prompt-specific HART.",
+        default=3,
+    )
 
     # ***********************************************************
     # Output / bookkeeping
@@ -730,6 +733,11 @@ if __name__ == "__main__":
         type=str,
         help="Directory name where outputs (jsons/images) for this run will be stored.",
         default="exp1",
+    )
+    parser.add_argument(
+        "--generate_centroid_grid",
+        action="store_true",
+        help="Generate and save grid image of centroid outputs. When enabled, full decoding runs with stop_after_fhat=False.",
     )
     parser.add_argument(
         "--stop_with_centroid_summaries",
