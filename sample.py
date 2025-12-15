@@ -4,6 +4,7 @@ import datetime
 import json
 import os
 import random
+import re
 import textwrap
 import time
 
@@ -24,36 +25,77 @@ from transformers import (
 
 from hart.modules.models.transformer import HARTForT2I
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
+from hart.utils.datasets import load_mjhq
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SHARED_FHAT_PATH = os.path.join(REPO_ROOT, "fhat_centroids.pt")
-CLUSTER_PROMPTS_PATH = os.path.join(REPO_ROOT, "cluster_prompts.json")
 
 
-def _annotate_tensor(img_tensor, caption):
-    """Add a caption strip to an image tensor and return a float tensor in [0,1]."""
+def _annotate_tensor(img_tensor, caption, scale=1.0):
+    """Add an overlaid caption to an image tensor and return a float tensor in [0,1]."""
     img_uint8 = img_tensor.clamp(0, 1).mul(255).to(torch.uint8)
     pil_img = Image.fromarray(img_uint8.permute(1, 2, 0).cpu().numpy())
 
-    bar_height = 32
-    new_img = Image.new("RGB", (pil_img.width, pil_img.height + bar_height), color=(0, 0, 0))
-    new_img.paste(pil_img, (0, 0))
+    if scale is not None and scale < 1.0:
+        resample = Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS
+        new_size = (max(1, int(pil_img.width * scale)), max(1, int(pil_img.height * scale)))
+        pil_img = pil_img.resize(new_size, resample=resample)
 
-    draw = ImageDraw.Draw(new_img)
+    img_rgba = pil_img.convert("RGBA")
+    draw = ImageDraw.Draw(img_rgba)
     font = ImageFont.load_default()
     caption = textwrap.shorten(caption, width=120, placeholder="…")
-    draw.text((4, pil_img.height + 8), caption, fill=(255, 255, 255), font=font)
+    text_w, text_h = draw.textsize(caption, font=font)
+    pad = 4
+    rect_w = min(pil_img.width, text_w + 2 * pad)
+    rect_h = text_h + 2 * pad
+    rect_x0 = 0
+    rect_y0 = pil_img.height - rect_h
+    rect_y0 = max(0, rect_y0)
+    draw.rectangle(
+        [(rect_x0, rect_y0), (rect_x0 + rect_w, rect_y0 + rect_h)],
+        fill=(0, 0, 0, 180),
+    )
+    draw.text((rect_x0 + pad, rect_y0 + pad), caption, fill=(255, 255, 255, 255), font=font)
 
-    return pil_to_tensor(new_img).float().div(255.0)
+    annotated = img_rgba.convert("RGB")
+    return pil_to_tensor(annotated).float().div(255.0)
 
 
-def _save_grid(images, prompts, cluster_id, out_path, nrow=8):
+def _save_grid(images, prompts, cluster_id, out_path, nrow=8, scale=1.0):
     captioned = [
-        _annotate_tensor(img, f"cluster {cluster_id} | {prompt}") for img, prompt in zip(images, prompts)
+        _annotate_tensor(img, f"cluster {cluster_id} | {prompt}", scale=scale) for img, prompt in zip(images, prompts)
     ]
     grid = torchvision.utils.make_grid(torch.stack(captioned), nrow=nrow)
     grid_np = grid.mul(255).clamp(0, 255).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
     Image.fromarray(grid_np).save(out_path)
+
+
+def _sanitize_filename(prompt: str) -> str:
+    safe = re.sub(r"[^a-z0-9]+", "_", prompt.lower()).strip("_")
+    return safe or "prompt"
+
+
+def _save_images(
+    sample_imgs: torch.Tensor,
+    prompts: list[str],
+    output_dir: str,
+    prompt_indices: list[int],
+    sample_idx: int,
+    resize_to: int | None,
+    prefix: str,
+):
+    sample_imgs_np = (
+        sample_imgs.mul(255).clamp(0, 255).to(torch.uint8).cpu().numpy()
+    )  # (B, 3, H, W)
+    os.makedirs(output_dir, exist_ok=True)
+    resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+
+    for prompt_idx, prompt, img_np in zip(prompt_indices, prompts, sample_imgs_np):
+        pil_img = Image.fromarray(np.transpose(img_np, (1, 2, 0)))
+        if resize_to:
+            pil_img = pil_img.resize((resize_to, resize_to), resample=resample)
+        fname = f"{prefix}{prompt_idx:04d}_{sample_idx:02d}_{_sanitize_filename(prompt)}.png"
+        pil_img.save(os.path.join(output_dir, fname))
 
 
 def _repeat_fhat(f_hat, batch_size):
@@ -110,6 +152,17 @@ def _generate_images(
     return output_imgs
 
 
+def _load_prompts_for_baseline(args):
+    """Load prompts when running baseline (non-shared) inference."""
+    dataset = (args.dataset or "").lower()
+    if dataset == "imagenet":
+        with open(args.imagenet_class_labels_path) as f:
+            return [x.strip() for x in f.readlines()]
+    if dataset == "mjhq":
+        return load_mjhq(args.mjhq_metadata_path)
+    return default_prompts
+
+
 def main(args):
     device = torch.device("cuda")
 
@@ -132,57 +185,190 @@ def main(args):
         if args.use_ema
         else model.autoregressive_infer_cfg
     )
-    alpha_stage = 3
+    alpha_stage = args.alpha
+    grid_scale = 1.0 if args.grid_full_res else 0.5
+    image_resize = args.resize_individual_to
 
-    # Load cluster prompts and fhat centroids
-    cluster_prompts_path = args.cluster_prompts_path or CLUSTER_PROMPTS_PATH
-    fhat_path = args.fhat_path or SHARED_FHAT_PATH
-    with open(cluster_prompts_path) as f:
-        cluster_prompts = json.load(f)
-    fhat_centroids = torch.load(fhat_path, map_location="cuda")
+    if args.shared_hart and not args.clustered_prompts:
+        raise ValueError("shared_hart requires clustered_prompts to be set.")
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    # Resolve experiment-scoped paths
+    experiment_dir = args.experiment_name
+    os.makedirs(experiment_dir, exist_ok=True)
+
+    cluster_prompts_path = args.cluster_prompts_path or os.path.join(
+        experiment_dir, f"{args.experiment_name}_cluster_prompts.json"
+    )
+    fhat_path = args.fhat_path or os.path.join(
+        experiment_dir, f"{args.experiment_name}_fhat_centroids.pt"
+    )
+
+    # Load cluster prompts and fhat centroids when requested
+    cluster_prompts = {}
+    fhat_centroids = {}
+    if args.clustered_prompts:
+        with open(cluster_prompts_path) as f:
+            cluster_prompts = json.load(f)
+        if args.shared_hart:
+            fhat_centroids = torch.load(fhat_path, map_location="cuda")
+
+    shared_grid_dir = os.path.join(experiment_dir, "cluster_grids_shared")
+    nonshared_grid_dir = os.path.join(experiment_dir, "cluster_grids_nonshared")
+    baseline_grid_dir = os.path.join(experiment_dir, "baseline_grids")
+    shared_img_dir = os.path.join(experiment_dir, "cluster_images_shared")
+    nonshared_img_dir = os.path.join(experiment_dir, "cluster_images_nonshared")
+    baseline_img_dir = os.path.join(experiment_dir, "baseline_images")
 
     with torch.inference_mode():
         with torch.autocast(
             "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
         ):
-            for cluster_id_str, prompts in cluster_prompts.items():
-                cluster_id = int(cluster_id_str)
-                out_prefix = os.path.join(args.output_dir, f"cluster_{cluster_id}")
+            # Clustered workflow
+            if args.clustered_prompts:
+                cluster_items = sorted(cluster_prompts.items(), key=lambda kv: int(kv[0]))
+                if args.shared_hart:
+                    for cluster_id_str, prompts in cluster_items:
+                        cluster_id = int(cluster_id_str)
+                        if cluster_id not in fhat_centroids:
+                            continue
+                        f_hat = fhat_centroids[cluster_id].to(device)
 
-                if not args.skip_shared and cluster_id in fhat_centroids:
-                    f_hat = fhat_centroids[cluster_id].to(device)
-                    imgs_shared = []
-                    for batch_prompts in _batched_list(prompts, args.batch_size):
-                        shared_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
-                        imgs = _generate_images(
-                            batch_prompts,
-                            text_model,
-                            text_tokenizer,
-                            infer_func,
-                            args.use_llm_system_prompt,
-                            args.max_token_length,
-                            args.cfg,
-                            args.seed,
-                            args.more_smooth,
-                            alpha_stage,
-                            shared_state=shared_state,
-                            is_shared=True,
-                        )
-                        imgs_shared.extend(list(imgs))
-                    if imgs_shared:
-                        _save_grid(
-                            imgs_shared,
-                            prompts,
-                            cluster_id,
-                            f"{out_prefix}_shared.png",
-                            nrow=args.grid_nrow,
-                        )
+                        if args.generate_grids:
+                            shared_imgs = []
+                            for batch_prompts in _batched_list(prompts, args.batch_size):
+                                batch_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
+                                imgs = _generate_images(
+                                    batch_prompts,
+                                    text_model,
+                                    text_tokenizer,
+                                    infer_func,
+                                    args.use_llm_system_prompt,
+                                    args.max_token_length,
+                                    args.cfg,
+                                    args.seed,
+                                    args.more_smooth,
+                                    alpha_stage,
+                                    shared_state=batch_state,
+                                    is_shared=True,
+                                )
+                                shared_imgs.extend(list(imgs))
+                            if shared_imgs:
+                                os.makedirs(shared_grid_dir, exist_ok=True)
+                                _save_grid(
+                                    shared_imgs,
+                                    prompts,
+                                    cluster_id,
+                                    os.path.join(shared_grid_dir, f"cluster_{cluster_id}_shared.png"),
+                                    nrow=args.grid_nrow,
+                                    scale=grid_scale,
+                                )
 
-                if args.generate_individual:
-                    indiv_images = []
-                    for batch_prompts in _batched_list(prompts, args.batch_size):
+                        if args.save_individual_images:
+                            os.makedirs(shared_img_dir, exist_ok=True)
+                            for sample_idx in range(args.num_images_per_prompt):
+                                seed = args.seed + sample_idx
+                                sample_imgs = []
+                                for start in range(0, len(prompts), args.batch_size):
+                                    batch_prompts = prompts[start : start + args.batch_size]
+                                    batch_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
+                                    imgs = _generate_images(
+                                        batch_prompts,
+                                        text_model,
+                                        text_tokenizer,
+                                        infer_func,
+                                        args.use_llm_system_prompt,
+                                        args.max_token_length,
+                                        args.cfg,
+                                        seed,
+                                        args.more_smooth,
+                                        alpha_stage,
+                                        shared_state=batch_state,
+                                        is_shared=True,
+                                    )
+                                    sample_imgs.extend(list(imgs))
+                                if sample_imgs:
+                                    _save_images(
+                                        torch.stack(sample_imgs),
+                                        prompts,
+                                        shared_img_dir,
+                                        prompt_indices=list(range(len(prompts))),
+                                        sample_idx=sample_idx,
+                                        resize_to=image_resize,
+                                        prefix=f"cluster_{cluster_id}_shared_",
+                                    )
+                else:
+                    for cluster_id_str, prompts in cluster_items:
+                        cluster_id = int(cluster_id_str)
+
+                        if args.generate_grids:
+                            cluster_imgs = []
+                            for batch_prompts in _batched_list(prompts, args.batch_size):
+                                imgs = _generate_images(
+                                    batch_prompts,
+                                    text_model,
+                                    text_tokenizer,
+                                    infer_func,
+                                    args.use_llm_system_prompt,
+                                    args.max_token_length,
+                                    args.cfg,
+                                    args.seed,
+                                    args.more_smooth,
+                                    alpha_stage,
+                                    shared_state=None,
+                                    is_shared=False,
+                                )
+                                cluster_imgs.extend(list(imgs))
+                            if cluster_imgs:
+                                os.makedirs(nonshared_grid_dir, exist_ok=True)
+                                _save_grid(
+                                    cluster_imgs,
+                                    prompts,
+                                    cluster_id,
+                                    os.path.join(nonshared_grid_dir, f"cluster_{cluster_id}_individual.png"),
+                                    nrow=args.grid_nrow,
+                                    scale=grid_scale,
+                                )
+
+                        if args.save_individual_images:
+                            os.makedirs(nonshared_img_dir, exist_ok=True)
+                            for sample_idx in range(args.num_images_per_prompt):
+                                seed = args.seed + sample_idx
+                                sample_imgs = []
+                                for start in range(0, len(prompts), args.batch_size):
+                                    batch_prompts = prompts[start : start + args.batch_size]
+                                    imgs = _generate_images(
+                                        batch_prompts,
+                                        text_model,
+                                        text_tokenizer,
+                                        infer_func,
+                                        args.use_llm_system_prompt,
+                                        args.max_token_length,
+                                        args.cfg,
+                                        seed,
+                                        args.more_smooth,
+                                        alpha_stage,
+                                        shared_state=None,
+                                        is_shared=False,
+                                    )
+                                    sample_imgs.extend(list(imgs))
+                                if sample_imgs:
+                                    _save_images(
+                                        torch.stack(sample_imgs),
+                                        prompts,
+                                        nonshared_img_dir,
+                                        prompt_indices=list(range(len(prompts))),
+                                        sample_idx=sample_idx,
+                                        resize_to=image_resize,
+                                        prefix=f"cluster_{cluster_id}_individual_",
+                                    )
+
+            # Baseline (non-shared) generation using dataset or default prompts
+            if not args.clustered_prompts:
+                baseline_prompts = _load_prompts_for_baseline(args)
+
+                if args.generate_grids:
+                    baseline_imgs = []
+                    for batch_prompts in _batched_list(baseline_prompts, args.batch_size):
                         imgs = _generate_images(
                             batch_prompts,
                             text_model,
@@ -197,38 +383,134 @@ def main(args):
                             shared_state=None,
                             is_shared=False,
                         )
-                        indiv_images.extend(list(imgs))
-                    if indiv_images:
+                        baseline_imgs.extend(list(imgs))
+                    if baseline_imgs:
+                        os.makedirs(baseline_grid_dir, exist_ok=True)
                         _save_grid(
-                            indiv_images,
-                            prompts,
-                            cluster_id,
-                            f"{out_prefix}_individual.png",
+                            baseline_imgs,
+                            baseline_prompts,
+                            f"{args.dataset or 'baseline'}",
+                            os.path.join(baseline_grid_dir, "baseline_individual.png"),
                             nrow=args.grid_nrow,
+                            scale=grid_scale,
                         )
+
+                if args.save_individual_images:
+                    os.makedirs(baseline_img_dir, exist_ok=True)
+                    for sample_idx in range(args.num_images_per_prompt):
+                        seed = args.seed + sample_idx
+                        sample_imgs = []
+                        for start in range(0, len(baseline_prompts), args.batch_size):
+                            batch_prompts = baseline_prompts[start : start + args.batch_size]
+                            imgs = _generate_images(
+                                batch_prompts,
+                                text_model,
+                                text_tokenizer,
+                                infer_func,
+                                args.use_llm_system_prompt,
+                                args.max_token_length,
+                                args.cfg,
+                                seed,
+                                args.more_smooth,
+                                alpha_stage,
+                                shared_state=None,
+                                is_shared=False,
+                            )
+                            sample_imgs.extend(list(imgs))
+                        if sample_imgs:
+                            _save_images(
+                                torch.stack(sample_imgs),
+                                baseline_prompts,
+                                baseline_img_dir,
+                                prompt_indices=list(range(len(baseline_prompts))),
+                                sample_idx=sample_idx,
+                                resize_to=image_resize,
+                                prefix="baseline_",
+                            )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+
+    # ***********************************************************
+    # Models
+    # ***********************************************************
     parser.add_argument(
         "--model_path",
         type=str,
         help="The path to HART model.",
-        default="hart-0.7b-1024px/llm",
+        default="./../saved_models/hart-0.7b-1024px/llm",
     )
     parser.add_argument(
         "--text_model_path",
         type=str,
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
-        default="Qwen2-VL-1.5B-Instruct",
+        default="./../saved_models/Qwen2-VL-1.5B-Instruct/",
     )
     parser.add_argument(
         "--shield_model_path",
         type=str,
         help="The path to shield model, we employ ShieldGemma-2B by default.",
-        default="pretrained_models/shieldgemma-2b",
+        default="./../saved_models/shieldgemma-2b",
     )
-    parser.add_argument("--prompt", type=str, help="A single prompt.", default="")
-    parser.add_argument("--prompt_list", nargs='+', type=str, help="Multiple prompts (space-separated)", default=None)
+
+    # ***********************************************************
+    # Prompts
+    # ***********************************************************
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        help="Experiment folder to pull cluster outputs from (matches clustering_test.py).",
+        default="exp1",
+    )
+    parser.add_argument(
+        "--clustered_prompts",
+        action="store_true",
+        help="Use clustered prompts/f_hat outputs from an experiment (otherwise baseline prompts).",
+    )
+    parser.add_argument(
+        "--shared_hart",
+        action="store_true",
+        help="Use shared f_hat centroids for clustered prompts (requires alpha).",
+    )
+    parser.add_argument(
+        "--cluster_prompts_path",
+        type=str,
+        help="Path to cluster_prompts.json (defaults to experiment_name/{experiment_name}_cluster_prompts.json).",
+        default=None,
+    )
+    parser.add_argument(
+        "--fhat_path",
+        type=str,
+        help="Path to fhat_centroids.pt (defaults to experiment_name/{experiment_name}_fhat_centroids.pt).",
+        default=None,
+    )
+
+    # ***********************************************************
+    # Data for baseline case
+    # ***********************************************************
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=["imagenet", "mjhq"],
+        help="Dataset to use for baseline (non-shared) prompts. Defaults to built-in prompts.",
+        default=None,
+    )
+    parser.add_argument(
+        "--imagenet_class_labels_path",
+        type=str,
+        help="Path to ImageNet class labels (used when dataset=imagenet).",
+        default="./../data/ImageNet/imagenet_classes.txt",
+    )
+    parser.add_argument(
+        "--mjhq_metadata_path",
+        type=str,
+        help="Path to MJHQ meta_data.json (used when dataset=mjhq).",
+        default="./../data/MJHQ-30K/meta_data.json",
+    )
+
+    # ***********************************************************
+    # Inference
+    # ***********************************************************
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--use_ema", type=bool, default=True)
     parser.add_argument("--max_token_length", type=int, default=300)
@@ -243,28 +525,25 @@ if __name__ == "__main__":
         default=True,
     )
     parser.add_argument(
-        "--sample_folder_dir",
-        type=str,
-        help="The folder where the image samples are stored",
-        default="samples/",
+        "--alpha",
+        type=int,
+        help="Stage index up to which shared HART is used (required if --shared_hart).",
+        default=3,
     )
     parser.add_argument(
-        "--cluster_prompts_path",
-        type=str,
-        help="Path to cluster_prompts.json generated by clustering_test.py.",
-        default=CLUSTER_PROMPTS_PATH,
+        "--batch_size",
+        type=int,
+        help="Batch size for prompt processing to avoid CUDA OOM.",
+        default=8,
     )
+
+    # ***********************************************************
+    # Grid outputs
+    # ***********************************************************
     parser.add_argument(
-        "--fhat_path",
-        type=str,
-        help="Path to fhat_centroids.pt generated by clustering_test.py.",
-        default=SHARED_FHAT_PATH,
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        help="Where to write cluster grids.",
-        default="cluster_samples",
+        "--generate_grids",
+        action="store_true",
+        help="Generate and save grids (clustered or baseline, depending on mode).",
     )
     parser.add_argument(
         "--grid_nrow",
@@ -273,21 +552,32 @@ if __name__ == "__main__":
         default=8,
     )
     parser.add_argument(
-        "--skip_shared",
+        "--grid_full_res",
         action="store_true",
-        help="Skip shared-state generation; only run individual prompts.",
+        help="Save grid images at original resolution (otherwise downsampled to keep grids compact).",
+    )
+
+    # ***********************************************************
+    # Individual image outputs
+    # ***********************************************************
+    parser.add_argument(
+        "--save_individual_images",
+        action="store_true",
+        help="Save individual images for each prompt (shared, non-shared, and baseline).",
     )
     parser.add_argument(
-        "--generate_individual",
-        action="store_true",
-        help="Generate per-prompt images without shared fhat (baseline).",
-    )
-    parser.add_argument(
-        "--batch_size",
+        "--num_images_per_prompt",
         type=int,
-        help="Batch size for prompt processing to avoid CUDA OOM.",
-        default=8,
+        help="Number of images to generate per prompt when saving individual images.",
+        default=1,
     )
+    parser.add_argument(
+        "--resize_individual_to",
+        type=int,
+        help="Resize saved individual images to this square resolution (omit to keep original).",
+        default=None,
+    )
+    
     args = parser.parse_args()
 
     main(args)
