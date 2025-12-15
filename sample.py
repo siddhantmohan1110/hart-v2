@@ -7,6 +7,7 @@ import random
 import re
 import textwrap
 import time
+from time import time as now
 
 import numpy as np
 import torch
@@ -188,6 +189,7 @@ def main(args):
     alpha_stage = args.alpha
     grid_scale = 1.0 if args.grid_full_res else 0.5
     image_resize = args.resize_individual_to
+    timings = {"individual_generation": {}, "meta": {}}
 
     if args.shared_hart and not args.clustered_prompts:
         raise ValueError("shared_hart requires clustered_prompts to be set.")
@@ -218,6 +220,7 @@ def main(args):
     shared_img_dir = os.path.join(experiment_dir, "cluster_images_shared")
     nonshared_img_dir = os.path.join(experiment_dir, "cluster_images_nonshared")
     baseline_img_dir = os.path.join(experiment_dir, "baseline_images")
+    timing_output_path = os.path.join(experiment_dir, "timing_profile_inference.json")
 
     with torch.inference_mode():
         with torch.autocast(
@@ -235,6 +238,8 @@ def main(args):
 
                         if args.generate_grids:
                             shared_imgs = []
+                            if args.enable_timing and args.warmup_iterations > 0:
+                                pass  # grid timing excluded; skip warmup here
                             for batch_prompts in _batched_list(prompts, args.batch_size):
                                 batch_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
                                 imgs = _generate_images(
@@ -268,6 +273,25 @@ def main(args):
                             for sample_idx in range(args.num_images_per_prompt):
                                 seed = args.seed + sample_idx
                                 sample_imgs = []
+                                if args.enable_timing:
+                                    sample_start = now()
+                                    if args.warmup_iterations > 0 and not args.generate_grids:
+                                        warmup_state = {"f_hat": _repeat_fhat(f_hat, len(prompts))}
+                                        for _ in range(args.warmup_iterations):
+                                            _ = _generate_images(
+                                                prompts,
+                                                text_model,
+                                                text_tokenizer,
+                                                infer_func,
+                                                args.use_llm_system_prompt,
+                                                args.max_token_length,
+                                                args.cfg,
+                                                seed,
+                                                args.more_smooth,
+                                                alpha_stage,
+                                                shared_state=warmup_state,
+                                                is_shared=True,
+                                            )
                                 for start in range(0, len(prompts), args.batch_size):
                                     batch_prompts = prompts[start : start + args.batch_size]
                                     batch_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
@@ -296,12 +320,18 @@ def main(args):
                                         resize_to=image_resize,
                                         prefix=f"cluster_{cluster_id}_shared_",
                                     )
+                        if args.enable_timing:
+                            timings["individual_generation"].setdefault("shared_clusters", {})[
+                                str(cluster_id)
+                            ] = now() - sample_start
                 else:
                     for cluster_id_str, prompts in cluster_items:
                         cluster_id = int(cluster_id_str)
 
                         if args.generate_grids:
                             cluster_imgs = []
+                            if args.enable_timing and args.warmup_iterations > 0:
+                                pass  # grid timing excluded; skip warmup here
                             for batch_prompts in _batched_list(prompts, args.batch_size):
                                 imgs = _generate_images(
                                     batch_prompts,
@@ -334,6 +364,24 @@ def main(args):
                             for sample_idx in range(args.num_images_per_prompt):
                                 seed = args.seed + sample_idx
                                 sample_imgs = []
+                                if args.enable_timing:
+                                    sample_start = now()
+                                    if args.warmup_iterations > 0 and not args.generate_grids:
+                                        for _ in range(args.warmup_iterations):
+                                            _ = _generate_images(
+                                                prompts,
+                                                text_model,
+                                                text_tokenizer,
+                                                infer_func,
+                                                args.use_llm_system_prompt,
+                                                args.max_token_length,
+                                                args.cfg,
+                                                seed,
+                                                args.more_smooth,
+                                                alpha_stage,
+                                                shared_state=None,
+                                                is_shared=False,
+                                            )
                                 for start in range(0, len(prompts), args.batch_size):
                                     batch_prompts = prompts[start : start + args.batch_size]
                                     imgs = _generate_images(
@@ -361,6 +409,10 @@ def main(args):
                                         resize_to=image_resize,
                                         prefix=f"cluster_{cluster_id}_individual_",
                                     )
+                        if args.enable_timing:
+                            timings["individual_generation"].setdefault("nonshared_clusters", {})[
+                                str(cluster_id)
+                            ] = now() - sample_start
 
             # Baseline (non-shared) generation using dataset or default prompts
             if not args.clustered_prompts:
@@ -368,6 +420,8 @@ def main(args):
 
                 if args.generate_grids:
                     baseline_imgs = []
+                    if args.enable_timing and args.warmup_iterations > 0:
+                        pass  # grid timing excluded; skip warmup here
                     for batch_prompts in _batched_list(baseline_prompts, args.batch_size):
                         imgs = _generate_images(
                             batch_prompts,
@@ -400,6 +454,24 @@ def main(args):
                     for sample_idx in range(args.num_images_per_prompt):
                         seed = args.seed + sample_idx
                         sample_imgs = []
+                        if args.enable_timing:
+                            sample_start = now()
+                            if args.warmup_iterations > 0 and not args.generate_grids:
+                                for _ in range(args.warmup_iterations):
+                                    _ = _generate_images(
+                                        baseline_prompts,
+                                        text_model,
+                                        text_tokenizer,
+                                        infer_func,
+                                        args.use_llm_system_prompt,
+                                        args.max_token_length,
+                                        args.cfg,
+                                        seed,
+                                        args.more_smooth,
+                                        alpha_stage,
+                                        shared_state=None,
+                                        is_shared=False,
+                                    )
                         for start in range(0, len(baseline_prompts), args.batch_size):
                             batch_prompts = baseline_prompts[start : start + args.batch_size]
                             imgs = _generate_images(
@@ -427,6 +499,26 @@ def main(args):
                                 resize_to=image_resize,
                                 prefix="baseline_",
                             )
+                    if args.enable_timing:
+                        timings["individual_generation"]["baseline"] = now() - sample_start
+
+    # Persist timing profile if requested
+    if args.enable_timing:
+        os.makedirs(experiment_dir, exist_ok=True)
+        timings["meta"].update(
+            {
+                "shared_hart": args.shared_hart,
+                "clustered_prompts": args.clustered_prompts,
+                "num_images_per_prompt": args.num_images_per_prompt,
+                "batch_size": args.batch_size,
+                "resize_individual_to": args.resize_individual_to,
+                "grid_scale": grid_scale,
+                "warmup_iterations": args.warmup_iterations,
+                "seed": args.seed,
+            }
+        )
+        with open(timing_output_path, "w") as f:
+            json.dump(timings, f, indent=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -577,7 +669,21 @@ if __name__ == "__main__":
         help="Resize saved individual images to this square resolution (omit to keep original).",
         default=None,
     )
-    
+
+    # ***********************************************************
+    # Latency profiling
+    # ***********************************************************
+    parser.add_argument(
+        "--enable_timing",
+        action="store_true",
+        help="Profile individual image generation (excludes grid creation) and save timing JSON.",
+    )
+    parser.add_argument(
+        "--warmup_iterations",
+        type=int,
+        help="GPU warmup iterations before timing (only when --enable_timing).",
+        default=0,
+    )
     args = parser.parse_args()
 
     main(args)
