@@ -12,7 +12,7 @@ import numpy as np
 import torchvision
 from PIL import Image
 import re
-from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
+from hart.utils import encode_prompts, default_prompts, llm_system_prompt, safety_check
 from sklearn.cluster import KMeans, AgglomerativeClustering
 import torch
 
@@ -33,6 +33,12 @@ from transformers import (
 )
 
 from hart.modules.models.transformer import HARTForT2I
+from hart.utils.constants import (
+    summarization_prompt_template,
+    enrichment_prompt_template,
+    banned_meta_terms,
+    llm_system_prompt,
+)
 
 
 def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
@@ -51,7 +57,6 @@ def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
             return self.texts[idx]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading SigLIP model from {model_name}...")
 
     processor = AutoProcessor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
@@ -62,7 +67,6 @@ def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_embeddings = []
-    print(f"Generating embeddings for {len(texts)} texts using SigLIP...")
 
     with torch.no_grad():
         for batch_texts in dataloader:
@@ -71,7 +75,6 @@ def load_siglip_embeddings(texts, model_name="siglip", batch_size=32):
             all_embeddings.append(outputs.cpu())
 
     all_embeddings = torch.cat(all_embeddings, dim=0)
-    print(f"Generated embeddings with shape: {all_embeddings.shape}")
 
     # Clean up
     del model
@@ -97,7 +100,6 @@ def load_clip_embeddings(texts, model_name="openai/clip-vit-large-patch14-336", 
             return self.texts[idx]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading CLIP model from {model_name}...")
 
     processor = CLIPProcessor.from_pretrained(model_name)
     model = CLIPModel.from_pretrained(model_name)
@@ -108,7 +110,6 @@ def load_clip_embeddings(texts, model_name="openai/clip-vit-large-patch14-336", 
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_embeddings = []
-    print(f"Generating embeddings for {len(texts)} texts using CLIP ViT-L/14@336px...")
 
     with torch.no_grad():
         for batch_texts in dataloader:
@@ -117,7 +118,6 @@ def load_clip_embeddings(texts, model_name="openai/clip-vit-large-patch14-336", 
             all_embeddings.append(outputs.cpu())
 
     all_embeddings = torch.cat(all_embeddings, dim=0)
-    print(f"Generated embeddings with shape: {all_embeddings.shape}")
 
     # Clean up
     del model
@@ -142,7 +142,6 @@ def load_qwen_embeddings(texts, model_name="Qwen2-VL-1.5B-Instruct/", batch_size
             return self.texts[idx]
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading Qwen model from {model_name} for embeddings...")
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
@@ -153,7 +152,6 @@ def load_qwen_embeddings(texts, model_name="Qwen2-VL-1.5B-Instruct/", batch_size
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     all_embeddings = []
-    print(f"Generating embeddings for {len(texts)} texts using Qwen...")
 
     with torch.no_grad():
         for batch_texts in dataloader:
@@ -166,7 +164,6 @@ def load_qwen_embeddings(texts, model_name="Qwen2-VL-1.5B-Instruct/", batch_size
             all_embeddings.append(embeddings.cpu())
 
     all_embeddings = torch.cat(all_embeddings, dim=0)
-    print(f"Generated embeddings with shape: {all_embeddings.shape}")
 
     # Clean up
     del model
@@ -176,88 +173,209 @@ def load_qwen_embeddings(texts, model_name="Qwen2-VL-1.5B-Instruct/", batch_size
     return all_embeddings
 
 
-# def clean_generated_summary(text):
-#     """Clean the generated summary text using regex patterns."""
-#     if not text or not text.strip():
-#         return ""
+def summarize_clusters(
+    cluster_prompts,
+    summarizer_model_path,
+    max_prompts_per_cluster=100,
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    summarizer_tokenizer = AutoTokenizer.from_pretrained(summarizer_model_path, padding_side="left")
+    summarizer_model = AutoModelForCausalLM.from_pretrained(
+        summarizer_model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
 
-#     # Remove quotes at the beginning and end
-#     text = re.sub(r'^[\"\']|[\"\']$', '', text.strip())
+    summary_centroids = {}
+    timings = {
+        "clusters_processed": len(cluster_prompts),
+        "per_cluster_sec": {},
+    }
+    total_start = time()
 
-#     # Remove meta-phrases and artifacts
-#     meta_patterns = [
-#         r'^(Summary|Prompt|Output|Answer):\s*',
-#         r'\n+(Summary|Prompt|Output|Answer):\s*.*$',
-#         r'To generate this image.*$',
-#         r'Create a (detailed )?image of.*$',
-#         r'The image should.*$',
-#         r'From these prompts.*$',
-#         r'In summary.*$',
-#         r'This prompt.*$',
-#         r'Please provide.*$',
-#         r'Based on.*$',
-#     ]
+    for topic_id, topic_prompts in cluster_prompts.items():
+        cluster_start = time()
+        prompts_text = "\n".join([f"- {p}" for p in topic_prompts[:max_prompts_per_cluster]])
+        summarization_prompt = summarization_prompt_template.format(prompts_text=prompts_text)
 
-#     for pattern in meta_patterns:
-#         text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.MULTILINE)
+        inputs = summarizer_tokenizer(
+            summarization_prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=2048,
+        ).to(device)
 
-#     # Remove repetitive patterns (like "apiary -> apiary" repeated)
-#     text = re.sub(r'(\b\w+\b)(\s*->\s*\1){3,}', r'\1', text)
+        with torch.no_grad():
+            outputs = summarizer_model.generate(
+                **inputs,
+                max_new_tokens=40,
+                temperature=0.2,
+                do_sample=True,
+                top_p=0.9,
+                repetition_penalty=1.2,
+            )
 
-#     # Remove numbered lists at the beginning
-#     text = re.sub(r'^\d+\.\s+', '', text)
+        input_length = inputs["input_ids"].shape[1]
+        generated_tokens = outputs[0][input_length:]
+        summary_raw = summarizer_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        summary = " ".join(summary_raw.split()).replace("\\", "")
+        first_sentence = re.split(r"[.\n]", summary, maxsplit=1)[0].strip()
+        summary = first_sentence or summary
+        summary = re.sub(r"[^A-Za-z., ]+", "", summary)
 
-#     # Remove extra whitespace and newlines
-#     text = re.sub(r'\n+', ' ', text)
-#     text = re.sub(r'\s+', ' ', text)
+        for term in banned_meta_terms:
+            summary = re.sub(rf"\b{re.escape(term)}\b", "", summary, flags=re.IGNORECASE)
+        summary = " ".join(summary.split()).strip("., ")
 
-#     # Extract first sentence if text is too long or contains multiple sentences
-#     sentences = re.split(r'[.!?]\s+', text)
-#     if sentences:
-#         text = sentences[0].strip()
-#         # Add period if not present
-#         if text and not text[-1] in '.!?':
-#             text += '.'
+        summary_centroids[topic_id] = summary
+        timings["per_cluster_sec"][str(topic_id)] = time() - cluster_start
 
-#     # Remove trailing incomplete sentences or artifacts
-#     text = re.sub(r'\s+(and|or|with|in|on|at|the|a)\s*\.?$', '.', text, flags=re.IGNORECASE)
+    merge_start = time()
+    summary_key_map = {}
+    merged_summary_centroids = {}
+    merged_cluster_prompts = {}
+    for topic_id, summary in summary_centroids.items():
+        key = summary.lower()
+        if key in summary_key_map:
+            primary_id = summary_key_map[key]
+            merged_cluster_prompts[primary_id].extend(cluster_prompts.get(topic_id, []))
+        else:
+            summary_key_map[key] = topic_id
+            merged_summary_centroids[topic_id] = summary
+            merged_cluster_prompts[topic_id] = list(cluster_prompts.get(topic_id, []))
+    summary_centroids = merged_summary_centroids
+    cluster_prompts = merged_cluster_prompts
+    timings["merge_sec"] = time() - merge_start
 
-#     # Final cleanup
-#     text = text.strip()
+    def _cluster_sort_key(cid):
+        cid_str = str(cid)
+        if cid_str.lstrip("-").isdigit():
+            return (0, int(cid))
+        return (1, cid_str)
 
-#     # If still empty or too short, return a generic fallback
-#     if len(text) < 3:
-#         return ""
+    ordered_ids = sorted(summary_centroids.keys(), key=_cluster_sort_key)
+    ordered_summary_centroids = {cid: summary_centroids[cid] for cid in ordered_ids}
+    ordered_cluster_prompts = {cid: cluster_prompts[cid] for cid in ordered_ids}
+    timings["total_sec"] = time() - total_start
 
-#     return text
+    del summarizer_model
+    del summarizer_tokenizer
+    torch.cuda.empty_cache()
+    return ordered_summary_centroids, ordered_cluster_prompts, timings
+
+
+def generate_rich_prompts(
+    prompts,
+    text_model_path,
+    batch_size=8,
+    max_new_tokens=80,
+    temperature=0.2,
+    top_p=0.9,
+    timings=None,
+):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained(text_model_path, padding_side="left")
+    model = AutoModelForCausalLM.from_pretrained(
+        text_model_path,
+        torch_dtype=torch.float16,
+        device_map="auto",
+    )
+    enriched = []
+    per_batch = {}
+    total_start = time()
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = prompts[start : start + batch_size]
+        batch_rich_prompts = [enrichment_prompt_template.format(pr=pr) for pr in batch_prompts]
+        batch_start = time()
+        inputs = tokenizer(
+            batch_rich_prompts,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=2048,
+        ).to(device)
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=True,
+                top_p=top_p,
+            )
+        per_batch[str(start // batch_size)] = time() - batch_start
+        for i, output in enumerate(outputs):
+            input_len = inputs["input_ids"][i].shape[0]
+            generated = output[input_len:]
+            summary_raw = tokenizer.decode(generated, skip_special_tokens=True).strip()
+            cleaned = " ".join(summary_raw.split()).strip()
+            cleaned = re.sub(r"[^A-Za-z., ]+", "", cleaned)
+            for term in banned_meta_terms:
+                cleaned = re.sub(rf"\b{re.escape(term)}\b", "", cleaned, flags=re.IGNORECASE)
+            cleaned = " ".join(cleaned.split()).strip("., ")
+            enriched.append(cleaned)
+    del model
+    del tokenizer
+    torch.cuda.empty_cache()
+    if timings is not None:
+        timings["enrichment_batches_sec"] = per_batch
+        timings["enrichment_total_sec"] = time() - total_start
+    return enriched
 
 
 def main(
         prompts,
-        text_model_path,
         args,
         limit=10**5,
-        clustering_algo="hdbscan",
-        batch_size=128,
-        siglip_model="siglip",
-        embedding_model="siglip",
         **hdb_configs):
+    overall_start = time()
+    timings = {
+        "meta": {
+            "embedding_model": embedding_model,
+            "clustering_algo": clustering_algo,
+            "use_ema": args.use_ema,
+            "max_prompts_per_cluster": args.max_prompts_per_cluster if hasattr(args, "max_prompts_per_cluster") else 100,
+            "summarizer_model_path": summarizer_model_path,
+        }
+    }
+    output_dir = args.experiment_name
+    os.makedirs(output_dir, exist_ok=True)
+    cluster_prompts_path = os.path.join(output_dir, "cluster_prompts.json")
+    summary_centroids_path = os.path.join(output_dir, "summary_centroids.json")
+    fhat_centroids_path = os.path.join(output_dir, "fhat_centroids.pt")
+    cluster_grid_path = os.path.join(output_dir, "cluster_centroids_grid.png")
+    timing_output_path = args.timing_output_path or os.path.join(output_dir, "timing_profile.json")
+
+    embedding_model=args.embedding_model
+    text_model_path=args.text_model_path
+    summarizer_model_path=args.summarizer_model_path
+    clustering_algo=args.clustering_algo
 
     if limit:
         prompts = prompts[:limit]
 
+    timings["meta"]["prompt_count"] = len(prompts)
+
+    if getattr(args, "enrich_prompts", False):
+        enrich_start = time()
+        prompts = generate_rich_prompts(
+            prompts,
+            summarizer_model_path,
+            batch_size=getattr(args, "enrichment_batch_size"),
+            timings=timings,
+        )
+        timings["enrichment_sec"] = time() - enrich_start
+
     # Select embedding model for clustering
+    embedding_start = time()
     if embedding_model.lower() == "siglip":
-        print("Using SigLIP for generating clustering embeddings...")
-        embeddings = load_siglip_embeddings(prompts, model_name=siglip_model, batch_size=batch_size)
+        embeddings = load_siglip_embeddings(prompts, model_name="siglip", batch_size=getattr(args, "embedding_batch_size"))
     elif embedding_model.lower() == "clip":
-        print("Using CLIP ViT-L/14@336px for generating clustering embeddings...")
-        embeddings = load_clip_embeddings(prompts, model_name="openai/clip-vit-large-patch14-336", batch_size=batch_size)
+        embeddings = load_clip_embeddings(prompts, model_name="openai/clip-vit-large-patch14-336", batch_size=getattr(args, "embedding_batch_size"))
     elif embedding_model.lower() == "qwen":
-        print("Using Qwen for generating clustering embeddings...")
-        embeddings = load_qwen_embeddings(prompts, model_name=text_model_path, batch_size=batch_size)
+        embeddings = load_qwen_embeddings(prompts, model_name=text_model_path, batch_size=getattr(args, "embedding_batch_size"))
     else:
         raise ValueError(f"Unknown embedding model: {embedding_model}. Choose from: siglip, clip, qwen")
+    timings["embedding_generation_sec"] = time() - embedding_start
 
     np_embed = embeddings.cpu().numpy()
     del embeddings
@@ -271,20 +389,19 @@ def main(
     for idx, prompt in enumerate(prompts):
         prompts[idx] =  prompt
 
+    clustering_init_start = time()
     if clustering_algo.lower() == "hdbscan":
         algo = HDBSCAN(**hdb_configs) #min_samples=3, gen_min_span_tree=True, prediction_data=True)
     elif clustering_algo.lower() == "kmeans":
-        print(f"Starting KMeans with {args.n_clusters} clusters")
         algo = KMeans(n_clusters=args.n_clusters)
     elif clustering_algo.lower() == "agglomerative":
-        print(f"Starting Agglomerative Clustering with {args.n_clusters} clusters")
         algo = AgglomerativeClustering(n_clusters=args.n_clusters, linkage='ward')
     else:
         raise ValueError(f"Unknown clustering algorithm: {clustering_algo}. Choose from: hdbscan, kmeans, agglomerative") 
 
     start = time()
     analyzer = BERTopicAnalyzer(clustering_model=algo, min_topic_size=3, n_components=3)
-        
+    timings["clustering_init_sec"] = time() - clustering_init_start
     read_time = time()
     # fit the clustering 
     analyzer.fit_model(prompts, np_embed)
@@ -293,9 +410,8 @@ def main(
     analyzer.documents = prompts
 
     end = time()
-    print(f"Input reading IO time = {read_time - start}")
-    print(f"Total Time = {end - start}")
-
+    timings["clustering_fit_sec"] = end - read_time
+    timings["clustering_total_sec"] = end - clustering_init_start
 
     topic_embeddings = analyzer.topic_model.topic_embeddings_
 
@@ -309,231 +425,80 @@ def main(
         if topic_id not in cluster_prompts:
             cluster_prompts[topic_id] = []
         cluster_prompts[topic_id].append(prompts[doc_idx])
-
-    print(f"Found {len(cluster_prompts)} clusters")
+    timings["cluster_count"] = len(cluster_prompts)
 
     # Save cluster prompts to file
+    save_clusters_start = time()
     cluster_prompts_serializable = {str(k): v for k, v in cluster_prompts.items()}
-    with open("cluster_prompts.json", "w") as f:
+    with open(cluster_prompts_path, "w") as f:
         json.dump(cluster_prompts_serializable, f, indent=2)
-    print(f"Saved prompts for {len(cluster_prompts)} clusters to cluster_prompts.json")
-
-    # Load qwen model for summarization
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    qwen_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
-    qwen_model = AutoModelForCausalLM.from_pretrained(
-        text_model_path,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-
-    # Generate summaries for each cluster
-    summary_centroids = {}
-
-    for topic_id, topic_prompts in cluster_prompts.items():
-        print(f"Processing cluster {topic_id} with {len(topic_prompts)} prompts...")
-
-        # Create a prompt for summarization
-        prompts_text = "\n".join([f"- {p}" for p in topic_prompts[:100]])  # Limit to first 100 to avoid token limits
-    #     summarization_prompt = f"""
-    # You are an expert visual prompt engineer for the HART (Hybrid Autoregressive Transformer) image generation model. Your goal is to convert short, ambiguous ImageNet class labels into rich, unambiguous, photorealistic visual descriptions.
-
-    # CRITICAL INSTRUCTION:
-    # The input labels come from the ImageNet dataset, which is based on the WordNet hierarchy. You must ALWAYS prioritize the WordNet definition of the object.
-    # - If the label is "Black Widow", you must describe the spider (Latrodectus), NEVER the Marvel character.
-    # - If the label is "Crane", you must check the context or provide a specific description of the bird (Gruidae) or the construction machine, but default to the most common ImageNet biological class if unsure, or specify the biological distinctiveness.
-    # - If the label is "Jaguar", describe the cat (Panthera onca), not the car (unless specified).
-
-    # Your output format for every label must be:
-    # [Subject Description] + [Environment/Context] + [Lighting/Style] 
-
-    # GUIDELINES:
-    # 1. Subject: Explicitly describe the visual features (color, texture, shape). Use scientific names if helpful for clarity.
-    # 2. Context: Place the object in its natural habitat or typical setting.
-    # 3. Style: Use high-quality keywords (4k, detailed texture, cinematic lighting) to ensure HART generates a high-fidelity image.
-    # 4. Output: Provide ONLY the final prompt text. Do not output conversational filler like "Here is the prompt." 
-    # 5. Output must be 40 tokens or fewer
-
-    # Example Input: "Black Widow"
-    # Example Output: A close-up macro photograph of a Latrodectus spider, commonly known as a black widow, featuring a shiny black bulbous abdomen with a distinctive red hourglass marking. The spider is resting on a chaotic silk web in a dark, shadowy corner. Natural lighting, high contrast, 8k resolution, photorealistic texture.
-
-    # Input: {prompts_text}
-    # Output: 
-    # """ 
-
-        
-        
-        
-        
-        summarization_prompt = f"""You are generating ONE text-to-image prompt to be used directly by an image generation model.
-
-Write the prompt as if you want the image to be generated, not described. Do NOT describe a list, do NOT mention prompts, summaries, clusters, or collections.
-
-The value must be a single sentence image-generation prompt.
-
-Strictly avoid meta or generic phrasing.
-
-Banned content (must not appear anywhere): prompt, prompts, answer, inference, summary, cluster, collection, various, depicting, output, to generate, the image should, diverse, images, visual similarity, objects, subject, scene showing, categories
-
-Task:
-From the prompts below, infer the most plausible shared visual concept and write ONE concise, visually grounded image-generation prompt.
-        
-Guidelines:
-- Focus on concrete visual attributes: object type, shape, texture, material, color, typical pose or viewpoint, and a likely environment if applicable.
-- Capture what is common across the prompts; ignore rare, weak, or incoherent outliers.
-- If the prompts span unrelated categories, choose ONE dominant and visually distinctive subject and ignore the rest.
-- Do NOT list or reference individual class names.
-- Avoid abstract, symbolic, or non-visual language.
-- Avoid stylistic adjectives unless clearly implied.
-
-Hard Constraints:
-- Output exactly ONE sentence.
-- Output must be 30 tokens or fewer.
-- No bullet points, lists, quotes, or line breaks.
-- No explanations or commentary.
-- Produce exactly ONE prompt and nothing else.
-
-Prompts:
-{prompts_text}
-
-Prompt:"""
-
-        # Tokenize and generate summary
-        inputs = qwen_tokenizer(summarization_prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-
-        with torch.no_grad():
-            outputs = qwen_model.generate(
-                **inputs,
-                max_new_tokens=40,
-                temperature=0.2,
-                do_sample=True,
-                top_p=0.9,
-                repetition_penalty=1.2,
-            )
-
-        # Decode only the newly generated tokens (skip the input prompt)
-        input_length = inputs['input_ids'].shape[1]
-        generated_tokens = outputs[0][input_length:]
-        summary_raw = qwen_tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-        # Normalize whitespace, drop newlines, and keep only the first sentence.
-        summary = " ".join(summary_raw.split()).replace("\\", "")
-        first_sentence = re.split(r"[.\n]", summary, maxsplit=1)[0].strip()
-        summary = first_sentence or summary
-        # Keep only letters, periods, commas, and spaces.
-        summary = re.sub(r"[^A-Za-z., ]+", "", summary)
-        # Remove banned meta words/phrases.
-        banned_terms = [
-            "prompt",
-            "prompts",
-            "answer",
-            "inference",
-            "summary",
-            "cluster",
-            "collection",
-            "various",
-            "depicting",
-            "output",
-            "to generate",
-            "the image should",
-            "diverse",
-            "images",
-            "visual similarity",
-            "objects",
-            "subject",
-            "scene showing",
-            "categories",
-        ]
-        for term in banned_terms:
-            summary = re.sub(rf"\b{re.escape(term)}\b", "", summary, flags=re.IGNORECASE)
-        summary = " ".join(summary.split()).strip("., ")
-
-        summary_centroids[topic_id] = summary
-
-    # Merge clusters that ended up with identical cleaned summaries.
-    summary_key_map = {}
-    merged_summary_centroids = {}
-    merged_cluster_prompts = {}
-    merged_info = {}
-    for topic_id, summary in summary_centroids.items():
-        key = summary.lower()
-        if key in summary_key_map:
-            primary_id = summary_key_map[key]
-            merged_info.setdefault(primary_id, []).append(topic_id)
-            merged_cluster_prompts[primary_id].extend(cluster_prompts.get(topic_id, []))
-        else:
-            summary_key_map[key] = topic_id
-            merged_summary_centroids[topic_id] = summary
-            merged_cluster_prompts[topic_id] = list(cluster_prompts.get(topic_id, []))
-    if merged_info:
-        print("\nMerging clusters with identical summaries:")
-        for primary_id, merged_ids in merged_info.items():
-            print(f"  Keeping {primary_id}, merging {merged_ids}")
-    summary_centroids = merged_summary_centroids
-    cluster_prompts = merged_cluster_prompts
-
-    # Save summary centroids ordered by increasing cluster_id.
-    def _cluster_sort_key(cid):
-        cid_str = str(cid)
-        if cid_str.lstrip("-").isdigit():
-            return (0, int(cid))
-        return (1, cid_str)
-
-    ordered_ids = sorted(summary_centroids.keys(), key=_cluster_sort_key)
-    ordered_summary_centroids = {cid: summary_centroids[cid] for cid in ordered_ids}
-    ordered_cluster_prompts = {cid: cluster_prompts[cid] for cid in ordered_ids}
+    timings["cluster_prompts_save_sec"] = time() - save_clusters_start
 
     # Save summary centroids to file
-    with open("summary_centroids.json", "w") as f:
-        json.dump(ordered_summary_centroids, f, indent=2)
-    # Save prompts grouped by cluster_id to file
-    with open("cluster_prompts.json", "w") as f:
-        json.dump(ordered_cluster_prompts, f, indent=2)
+    summary_start = time()
+    ordered_summary_centroids, ordered_cluster_prompts, summary_timings = summarize_clusters(
+        cluster_prompts,
+        summarizer_model_path,
+        max_prompts_per_cluster=getattr(args, "max_prompts_per_cluster", 100),
+    )
+    timings["summarization"] = summary_timings
+    timings["summarization"]["total_with_overhead_sec"] = time() - summary_start
 
-    print(f"\nSaved summaries for {len(summary_centroids)} clusters to summary_centroids.json")
+    summary_save_start = time()
+    with open(summary_centroids_path, "w") as f:
+        json.dump(ordered_summary_centroids, f, indent=2)
+    with open(cluster_prompts_path, "w") as f:
+        json.dump({str(k): v for k, v in ordered_cluster_prompts.items()}, f, indent=2)
+    timings["summary_save_sec"] = time() - summary_save_start
 
     if args.stop_with_centroid_summaries:
+        timings["overall_sec"] = time() - overall_start
+        if timing_output_path:
+            with open(timing_output_path, "w") as f:
+                json.dump(timings, f, indent=2)
         return None
 
-    # Clean up qwen model before loading HART
-    del qwen_model
-    del qwen_tokenizer
-    torch.cuda.empty_cache()
-
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Load HART model for generating f_hats from summaries
-    print("\nLoading HART model...")
+    hart_load_start = time()
     hart_model = AutoModel.from_pretrained(args.model_path)
     hart_model = hart_model.to(device)
     hart_model.eval()
+    timings["hart_model_load_sec"] = time() - hart_load_start
 
     if args.use_ema:
+        ema_start = time()
         ema_model = copy.deepcopy(hart_model)
         ema_model.load_state_dict(
             torch.load(os.path.join(args.model_path, "ema_model.bin"))
         )
+        timings["ema_load_sec"] = time() - ema_start
 
     # Load Qwen text model for encoding summaries for HART forward pass
-    print("\nLoading Qwen model for HART text embeddings...")
-    hart_text_tokenizer = AutoTokenizer.from_pretrained(text_model_path)
+    hart_text_load_start = time()
+    hart_text_tokenizer = AutoTokenizer.from_pretrained(text_model_path, padding_side="left")
     hart_text_model = AutoModel.from_pretrained(text_model_path).to(device)
     hart_text_model.eval()
+    timings["hart_text_model_load_sec"] = time() - hart_text_load_start
 
     # Generate f_hats for each summary centroid with alpha=3
     fhat_centroids = {}
     cluster_output_images = {}  # Changed to dict to maintain cluster_id association
     alpha = 3
-    fhat_save_path = "./fhat_centroids"
+    fhat_save_path = os.path.join(output_dir, "fhat_centroids")
     os.makedirs(fhat_save_path, exist_ok=True)
 
-    print(f"\nGenerating f_hats for {len(summary_centroids)} cluster summaries with alpha={alpha}...")
+    fhat_generation_start = time()
+    fhat_cluster_timings = {}
 
     # Sort cluster IDs to process in order
-    sorted_cluster_ids = sorted(summary_centroids.keys(), key=lambda x: int(x) if str(x).lstrip('-').isdigit() else float('inf'))
+    sorted_cluster_ids = sorted(ordered_summary_centroids.keys(), key=lambda x: int(x) if str(x).lstrip('-').isdigit() else float('inf'))
 
     with torch.inference_mode():
         with torch.autocast("cuda", enabled=True, dtype=torch.float16, cache_enabled=True):
             for topic_id in sorted_cluster_ids:
-                summary = summary_centroids[topic_id]
-                print(f"Processing summary for cluster {topic_id}...")
+                cluster_gen_start = time()
+                summary = ordered_summary_centroids[topic_id]
 
                 # Encode the summary using the same function from sample.py
                 (
@@ -580,13 +545,17 @@ Prompt:"""
                 if os.path.exists(fhat_file):
                     fhat_data = torch.load(fhat_file)
                     fhat_centroids[topic_id] = fhat_data['f_hat']
-                    print(f"Saved f_hat for cluster {topic_id} with shape {fhat_data['f_hat'].shape}")
                     # Clean up the temporary file
                     os.remove(fhat_file)
-                else:
-                    print(f"Warning: f_hat file not found for cluster {topic_id}")
+                fhat_cluster_timings[str(topic_id)] = time() - cluster_gen_start
+
+    timings["fhat_generation"] = {
+        "total_sec": time() - fhat_generation_start,
+        "per_cluster_sec": fhat_cluster_timings,
+    }
 
     # Create and save grid image of all cluster centroids in sorted order
+    grid_time_start = time()
     if cluster_output_images:
         # Stack images in sorted order by cluster_id
         sorted_images = [cluster_output_images[cid] for cid in sorted_cluster_ids]
@@ -595,14 +564,20 @@ Prompt:"""
         grid_np = grid.to(torch.float16).permute(1, 2, 0).mul_(255).cpu().numpy()
         grid_np = Image.fromarray(grid_np.astype(np.uint8))
 
-        grid_save_path = "cluster_centroids_grid.png"
-        grid_np.save(grid_save_path)
-        print(f"\nSaved grid of {len(cluster_output_images)} cluster centroid images to {grid_save_path}")
-        print(f"Images ordered by cluster_id: {sorted_cluster_ids}")
+        grid_np.save(cluster_grid_path)
+        timings["cluster_grid"] = {
+            "save_path": cluster_grid_path,
+            "cluster_id_order": sorted_cluster_ids,
+            "save_sec": time() - grid_time_start,
+        }
+    else:
+        timings["cluster_grid"] = {"save_sec": time() - grid_time_start, "cluster_id_order": []}
 
     # Save all f_hat centroids
-    torch.save(fhat_centroids, "fhat_centroids.pt")
-    print(f"\nSaved f_hats for {len(fhat_centroids)} clusters to fhat_centroids.pt")
+    fhat_save_start = time()
+    torch.save(fhat_centroids, fhat_centroids_path)
+    timings["fhat_save_sec"] = time() - fhat_save_start
+    timings["fhat_saved_count"] = len(fhat_centroids)
 
     # Clean up
     del hart_model
@@ -612,16 +587,16 @@ Prompt:"""
     del hart_text_tokenizer
     torch.cuda.empty_cache()
 
-    
-
-    # total_time = time.time() - start_time
-    # print(f"Generate {len(prompts)} images take {total_time:2f}s.")
-    
-    # print("Visualizing")
-    # analyzer.visualize_3d_interactive()
-    # print("finished visualizing")
-
-
+    timings["overall_sec"] = time() - overall_start
+    timings["saved_paths"] = {
+        "cluster_prompts": cluster_prompts_path,
+        "summary_centroids": summary_centroids_path,
+        "fhat_centroids": fhat_centroids_path,
+        "cluster_grid": timings.get("cluster_grid", {}).get("save_path"),
+    }
+    if timing_output_path:
+        with open(timing_output_path, "w") as f:
+            json.dump(timings, f, indent=2)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -647,20 +622,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--text_model_path",
         type=str,
-        help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
+        help="Model path to use for HART text embeddings, HART employs Qwen2-VL-1.5B-Instruct by default.",
         default="Qwen2-VL-1.5B-Instruct/",
     )
     parser.add_argument(
-        "--siglip_model",
+        "--summarizer_model_path",
         type=str,
-        help="The SigLIP model to use for clustering embeddings.",
-        default="siglip",
+        help="Model path to use for summarization/rich prompt generation.",
+        default="Qwen2-VL-1.5B-Instruct/",
+    )
+    parser.add_argument(
+        "--experiment_name",
+        type=str,
+        help="Directory name where outputs (jsons/images) for this run will be stored.",
+        default="experiment_run",
     )
     parser.add_argument(
         "--embedding_model",
         type=str,
         help="The embedding model for clustering: siglip, clip (ViT-L/14@336px), or qwen.",
-        default="siglip",
+        default="clip",
         choices=["siglip", "clip", "qwen"],
     )
     parser.add_argument(
@@ -674,6 +655,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_token_length", type=int, default=300)
     parser.add_argument("--use_llm_system_prompt", type=bool, default=True)
     parser.add_argument(
+        "--max_prompts_per_cluster",
+        type=int,
+        help="Maximum prompts per cluster to include in the summarization prompt.",
+        default=100,
+    )
+    parser.add_argument(
         "--cfg", type=float, help="Classifier-free guidance scale.", default=4.5
     )
     parser.add_argument(
@@ -684,31 +671,44 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--stop_with_centroid_summaries", action="store_true", help="If set, the program will stop after generating centroid summaries.")
+    parser.add_argument(
+        "--timing_output_path",
+        type=str,
+        help="Where to write profiling/timing information as JSON.",
+        default="timing_profile.json",
+    )
+    parser.add_argument(
+        "--enrich_prompts",
+        action="store_true",
+        help="Enrich ImageNet labels into richer visual descriptions before clustering.",
+    )
+    parser.add_argument(
+        "--enrichment_batch_size",
+        type=int,
+        help="Batch size for prompt enrichment.",
+        default=8,
+    )
+    parser.add_argument(
+        "--embedding_batch_size",
+        type=int,
+        help="Batch size for embedding generation.",
+        default=128,
+    )
 
     args = parser.parse_args()
-    clustering_algo = args.clustering_algo
     # prompts = load_mjhq(args.get('mjhq-meta-path'))
     with open("data/imagenet_classes.txt") as f:
         imagenet_labels = [x.strip() for x in f.readlines()]
-    # with open('./../ILSVRC2012_devkit_t12/imagenet_classid_to_label.json') as f:
-    #     val_map = json.load(f)
-
-    # imagenet_labels = []
-
-    # for label in val_map.values():
-    #     # Split at commas → e.g. "tench, Tinca tinca"
-    #     parts = label.split(',')
-    #     # Clean spaces and lowercase for consistency
-    #     parts = [p.strip().lower() for p in parts]
-    #     imagenet_labels.extend(parts)
-
-    # Print results
-    print("Total labels:", len(imagenet_labels))
+   
     prompts = imagenet_labels
 
-    text_model_path = args.text_model_path
     hdb_config = dict(min_samples=3, gen_min_span_tree=True, prediction_data=True)
-    main(prompts, text_model_path, args, limit = None, clustering_algo=clustering_algo, batch_size=128, siglip_model=args.siglip_model, embedding_model=args.embedding_model, **hdb_config)
+    main(
+        prompts,
+        args,
+        limit=None,
+        **hdb_config,
+    )
     # test_BertTopic(prompts, text_model_path)
 
     # test_TTV(prompts)

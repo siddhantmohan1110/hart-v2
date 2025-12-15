@@ -1,14 +1,18 @@
 import argparse
 import copy
 import datetime
+import json
 import os
 import random
+import textwrap
 import time
 
 import numpy as np
 import torch
 import torchvision
 from PIL import Image
+from PIL import ImageDraw, ImageFont
+from torchvision.transforms.functional import pil_to_tensor
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -22,48 +26,88 @@ from hart.modules.models.transformer import HARTForT2I
 from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SHARED_STATE_PATH = os.path.join(
-    REPO_ROOT, "fhat", "fhat_kv_stage_3.pt"
-)  # shared cache always uses stage 3
+SHARED_FHAT_PATH = os.path.join(REPO_ROOT, "fhat_centroids.pt")
+CLUSTER_PROMPTS_PATH = os.path.join(REPO_ROOT, "cluster_prompts.json")
 
-#  "tench",
-#     "hen",
-#     "magpie",
-#     "quail",
-#     "drake",
-#     "conch",
-#     "bittern",
-#     "boxer",
-#     "pug",
-#     "chow",
-#     "tabby",
-#     "ladybug",
-#     "bighorn",
-#     "mink",
-#     "quill"
-def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
-    if not store_separately and len(sample_imgs) > 1:
-        grid = torchvision.utils.make_grid(sample_imgs, nrow=12)
-        grid_np = grid.to(torch.float16).permute(1, 2, 0).mul_(255).cpu().numpy()
 
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        grid_np = Image.fromarray(grid_np.astype(np.uint8))
-        grid_np.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_sample_images.png"))
-        print(f"Example images are saved to {sample_folder_dir}")
-    else:
-        # bs, 3, r, r
-        sample_imgs_np = sample_imgs.mul_(255).cpu().numpy()
-        num_imgs = sample_imgs_np.shape[0]
-        os.makedirs(sample_folder_dir, exist_ok=True)
-        for img_idx in range(num_imgs):
-            cur_img = sample_imgs_np[img_idx]
-            cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
-            cur_img_store = Image.fromarray(cur_img)
-            cur_img_store.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_{img_idx:06d}.png"))
-            print(f"Image {img_idx} saved.")
+def _annotate_tensor(img_tensor, caption):
+    """Add a caption strip to an image tensor and return a float tensor in [0,1]."""
+    img_uint8 = img_tensor.clamp(0, 1).mul(255).to(torch.uint8)
+    pil_img = Image.fromarray(img_uint8.permute(1, 2, 0).cpu().numpy())
 
-    with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
-        f.write("\n".join(prompts))
+    bar_height = 32
+    new_img = Image.new("RGB", (pil_img.width, pil_img.height + bar_height), color=(0, 0, 0))
+    new_img.paste(pil_img, (0, 0))
+
+    draw = ImageDraw.Draw(new_img)
+    font = ImageFont.load_default()
+    caption = textwrap.shorten(caption, width=120, placeholder="…")
+    draw.text((4, pil_img.height + 8), caption, fill=(255, 255, 255), font=font)
+
+    return pil_to_tensor(new_img).float().div(255.0)
+
+
+def _save_grid(images, prompts, cluster_id, out_path, nrow=8):
+    captioned = [
+        _annotate_tensor(img, f"cluster {cluster_id} | {prompt}") for img, prompt in zip(images, prompts)
+    ]
+    grid = torchvision.utils.make_grid(torch.stack(captioned), nrow=nrow)
+    grid_np = grid.mul(255).clamp(0, 255).permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+    Image.fromarray(grid_np).save(out_path)
+
+
+def _repeat_fhat(f_hat, batch_size):
+    repeat_shape = [batch_size] + [1] * (f_hat.dim() - 1)
+    return f_hat.repeat(*repeat_shape)
+
+
+def _batched_list(items, batch_size):
+    for start in range(0, len(items), batch_size):
+        yield items[start:start + batch_size]
+
+
+def _generate_images(
+    prompts,
+    text_model,
+    text_tokenizer,
+    infer_func,
+    use_llm_system_prompt,
+    max_token_length,
+    cfg,
+    seed,
+    more_smooth,
+    alpha_stage,
+    shared_state=None,
+    is_shared=True,
+):
+    (
+        context_tokens,
+        context_mask,
+        context_position_ids,
+        context_tensor,
+    ) = encode_prompts(
+        prompts,
+        text_model,
+        text_tokenizer,
+        max_token_length,
+        llm_system_prompt,
+        use_llm_system_prompt,
+    )
+
+    output_imgs = infer_func(
+        B=context_tensor.size(0),
+        label_B=context_tensor,
+        cfg=cfg,
+        g_seed=seed,
+        more_smooth=more_smooth,
+        context_position_ids=context_position_ids,
+        context_mask=context_mask,
+        save_fhat=False,
+        is_shared_hart=is_shared,
+        alpha=alpha_stage,
+        shared_state=shared_state,
+    )
+    return output_imgs
 
 
 def main(args):
@@ -79,128 +123,89 @@ def main(args):
             torch.load(os.path.join(args.model_path, "ema_model.bin"))
         )
 
-    text_tokenizer = AutoTokenizer.from_pretrained(args.text_model_path)
+    text_tokenizer = AutoTokenizer.from_pretrained(args.text_model_path, padding_side="left")
     text_model = AutoModel.from_pretrained(args.text_model_path).to(device)
     text_model.eval()
-    text_tokenizer_max_length = args.max_token_length
 
-    # safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
-    # safety_checker_model = AutoModelForCausalLM.from_pretrained(
-    #     args.shield_model_path,
-    #     device_map="auto",
-    #     torch_dtype=torch.bfloat16,
-    # ).to(device)
+    infer_func = (
+        ema_model.autoregressive_infer_cfg
+        if args.use_ema
+        else model.autoregressive_infer_cfg
+    )
+    alpha_stage = 3
 
-    prompts = []
-    if args.prompt:
-        prompts = [args.prompt]
-    elif args.prompt_list:
-        prompts = args.prompt_list
-    else:
-        print(
-            "No prompt is provided. Will randomly sample 4 prompts from default prompts."
-        )
-        prompts = random.sample(default_prompts, 4)
+    # Load cluster prompts and fhat centroids
+    cluster_prompts_path = args.cluster_prompts_path or CLUSTER_PROMPTS_PATH
+    fhat_path = args.fhat_path or SHARED_FHAT_PATH
+    with open(cluster_prompts_path) as f:
+        cluster_prompts = json.load(f)
+    fhat_centroids = torch.load(fhat_path, map_location="cuda")
 
-    # for idx, prompt in enumerate(prompts):
-    #     if safety_check.is_dangerous(
-    #         safety_checker_tokenizer, safety_checker_model, prompt
-    #     ):
-    #         prompts[idx] = random.sample(default_prompts, 1)[0]
-    #         print(
-    #             f"Detected Unsafe prompt with index {idx}, will replace by one of default prompts."
-    #         )
+    os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load shared state (fhat_centroids) for specified cluster_ids
-    # Use path relative to script location (one directory up from hart-v2/)
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-    FHAT_CENTROIDS_PATH = os.path.join(SCRIPT_DIR, "..", "fhat_centroids.pt")
-    # Convert cluster_ids to list if it's a single integer
-    cluster_ids = args.cluster_ids
-    if isinstance(cluster_ids, int):
-        cluster_ids = [cluster_ids] * len(prompts)
-    shared_state_cache = None
-
-    if os.path.exists(FHAT_CENTROIDS_PATH):
-        fhat_centroids = torch.load(FHAT_CENTROIDS_PATH, map_location="cpu")
-        print(f"Loaded fhat_centroids from {FHAT_CENTROIDS_PATH}")
-        print(f"Available cluster IDs: {list(fhat_centroids.keys())}")
-
-        # Ensure number of cluster_ids matches number of prompts
-        if len(cluster_ids) != len(prompts):
-            print(f"Warning: Number of cluster_ids ({len(cluster_ids)}) doesn't match number of prompts ({len(prompts)})")
-            print(f"Will replicate first cluster_id to match batch size")
-            cluster_ids = [cluster_ids[0]] * len(prompts)
-
-        # Load and concatenate f_hats for each cluster_id
-        fhat_list = []
-        for cid in cluster_ids:
-            if cid in fhat_centroids:
-                fhat_list.append(fhat_centroids[cid])
-                print(f"Loaded f_hat from cluster {cid} with shape {fhat_centroids[cid].shape}")
-            else:
-                print(f"Warning: Cluster ID {cid} not found in fhat_centroids")
-                fhat_list.append(None)
-
-        # Check if all f_hats were loaded successfully
-        if all(f is not None for f in fhat_list):
-            # Concatenate along batch dimension (dim=0)
-            concatenated_fhat = torch.cat(fhat_list, dim=0)
-            shared_state_cache = {'f_hat': concatenated_fhat}
-            print(f"Concatenated f_hats from {len(cluster_ids)} clusters, final shape: {concatenated_fhat.shape}")
-        else:
-            print(f"Warning: Some cluster IDs were not found, proceeding without shared state")
-    else:
-        print(f"Warning: fhat_centroids not found at {FHAT_CENTROIDS_PATH}")
-
-    alpha_stage = 3  # Use stage 3 for clustering
-
-    start_time = time.time()
     with torch.inference_mode():
         with torch.autocast(
             "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
         ):
+            for cluster_id_str, prompts in cluster_prompts.items():
+                cluster_id = int(cluster_id_str)
+                out_prefix = os.path.join(args.output_dir, f"cluster_{cluster_id}")
 
-            (
-                context_tokens,
-                context_mask,
-                context_position_ids,
-                context_tensor,
-            ) = encode_prompts(
-                prompts,
-                text_model,
-                text_tokenizer,
-                args.max_token_length,
-                llm_system_prompt,
-                args.use_llm_system_prompt,
-            )
+                if not args.skip_shared and cluster_id in fhat_centroids:
+                    f_hat = fhat_centroids[cluster_id].to(device)
+                    imgs_shared = []
+                    for batch_prompts in _batched_list(prompts, args.batch_size):
+                        shared_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
+                        imgs = _generate_images(
+                            batch_prompts,
+                            text_model,
+                            text_tokenizer,
+                            infer_func,
+                            args.use_llm_system_prompt,
+                            args.max_token_length,
+                            args.cfg,
+                            args.seed,
+                            args.more_smooth,
+                            alpha_stage,
+                            shared_state=shared_state,
+                            is_shared=True,
+                        )
+                        imgs_shared.extend(list(imgs))
+                    if imgs_shared:
+                        _save_grid(
+                            imgs_shared,
+                            prompts,
+                            cluster_id,
+                            f"{out_prefix}_shared.png",
+                            nrow=args.grid_nrow,
+                        )
 
-            infer_func = (
-                ema_model.autoregressive_infer_cfg
-                if args.use_ema
-                else model.autoregressive_infer_cfg
-            )
-            output_imgs = infer_func(
-                B=context_tensor.size(0),
-                label_B=context_tensor,
-                cfg=args.cfg,
-                g_seed=args.seed,
-                more_smooth=args.more_smooth,
-                context_position_ids=context_position_ids,
-                context_mask=context_mask,
-                save_fhat=False,
-                is_shared_hart=True,
-                alpha=alpha_stage,
-                shared_state=shared_state_cache,
-            )
-
-    total_time = time.time() - start_time
-    print(f"Generate {len(prompts)} images take {total_time:2f}s.")
-
-    save_images(
-        output_imgs.clone(), args.sample_folder_dir, args.store_seperately, prompts
-    )
-
+                if args.generate_individual:
+                    indiv_images = []
+                    for batch_prompts in _batched_list(prompts, args.batch_size):
+                        imgs = _generate_images(
+                            batch_prompts,
+                            text_model,
+                            text_tokenizer,
+                            infer_func,
+                            args.use_llm_system_prompt,
+                            args.max_token_length,
+                            args.cfg,
+                            args.seed,
+                            args.more_smooth,
+                            alpha_stage,
+                            shared_state=None,
+                            is_shared=False,
+                        )
+                        indiv_images.extend(list(imgs))
+                    if indiv_images:
+                        _save_grid(
+                            indiv_images,
+                            prompts,
+                            cluster_id,
+                            f"{out_prefix}_individual.png",
+                            nrow=args.grid_nrow,
+                        )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -244,16 +249,44 @@ if __name__ == "__main__":
         default="samples/",
     )
     parser.add_argument(
-        "--store_seperately",
-        help="Store image samples in a grid or separately, set to False by default.",
-        action="store_true",
+        "--cluster_prompts_path",
+        type=str,
+        help="Path to cluster_prompts.json generated by clustering_test.py.",
+        default=CLUSTER_PROMPTS_PATH,
     )
     parser.add_argument(
-        "--cluster_ids",
-        nargs='+',
+        "--fhat_path",
+        type=str,
+        help="Path to fhat_centroids.pt generated by clustering_test.py.",
+        default=SHARED_FHAT_PATH,
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        help="Where to write cluster grids.",
+        default="cluster_samples",
+    )
+    parser.add_argument(
+        "--grid_nrow",
         type=int,
-        help="Cluster IDs to use f_hats from fhat_centroids.pt (one per prompt, space-separated)",
-        default=36,
+        help="Number of images per row in saved grids.",
+        default=8,
+    )
+    parser.add_argument(
+        "--skip_shared",
+        action="store_true",
+        help="Skip shared-state generation; only run individual prompts.",
+    )
+    parser.add_argument(
+        "--generate_individual",
+        action="store_true",
+        help="Generate per-prompt images without shared fhat (baseline).",
+    )
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        help="Batch size for prompt processing to avoid CUDA OOM.",
+        default=8,
     )
     args = parser.parse_args()
 
