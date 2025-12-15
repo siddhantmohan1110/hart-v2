@@ -327,11 +327,11 @@ def main(args):
     overall_start = time()
     timings = {
         "meta": {
-            "embedding_model": embedding_model,
-            "clustering_algo": clustering_algo,
+            "embedding_model": args.embedding_model,
+            "clustering_algo": args.clustering_algo,
             "use_ema": args.use_ema,
             "max_prompts_per_cluster": args.max_prompts_per_cluster if hasattr(args, "max_prompts_per_cluster") else 100,
-            "summarizer_model_path": summarizer_model_path,
+            "summarizer_model_path": args.summarizer_model_path,
         }
     }
     output_dir = args.experiment_name
