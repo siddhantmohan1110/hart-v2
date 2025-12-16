@@ -276,22 +276,24 @@ def main(args):
                                 if args.enable_timing:
                                     sample_start = now()
                                     if args.warmup_iterations > 0 and not args.generate_grids:
-                                        warmup_state = {"f_hat": _repeat_fhat(f_hat, len(prompts))}
                                         for _ in range(args.warmup_iterations):
-                                            _ = _generate_images(
-                                                prompts,
-                                                text_model,
-                                                text_tokenizer,
-                                                infer_func,
-                                                args.use_llm_system_prompt,
-                                                args.max_token_length,
-                                                args.cfg,
-                                                seed,
-                                                args.more_smooth,
-                                                alpha_stage,
-                                                shared_state=warmup_state,
-                                                is_shared=True,
-                                            )
+                                            for start_w in range(0, len(prompts), args.batch_size):
+                                                warmup_batch = prompts[start_w : start_w + args.batch_size]
+                                                warmup_state = {"f_hat": _repeat_fhat(f_hat, len(warmup_batch))}
+                                                tmp = _generate_images(
+                                                    warmup_batch,
+                                                    text_model,
+                                                    text_tokenizer,
+                                                    infer_func,
+                                                    args.use_llm_system_prompt,
+                                                    args.max_token_length,
+                                                    args.cfg,
+                                                    seed,
+                                                    args.more_smooth,
+                                                    alpha_stage,
+                                                    shared_state=warmup_state,
+                                                    is_shared=True,
+                                                )
                                 for start in range(0, len(prompts), args.batch_size):
                                     batch_prompts = prompts[start : start + args.batch_size]
                                     batch_state = {"f_hat": _repeat_fhat(f_hat, len(batch_prompts))}
@@ -368,20 +370,22 @@ def main(args):
                                     sample_start = now()
                                     if args.warmup_iterations > 0 and not args.generate_grids:
                                         for _ in range(args.warmup_iterations):
-                                            _ = _generate_images(
-                                                prompts,
-                                                text_model,
-                                                text_tokenizer,
-                                                infer_func,
-                                                args.use_llm_system_prompt,
-                                                args.max_token_length,
-                                                args.cfg,
-                                                seed,
-                                                args.more_smooth,
-                                                alpha_stage,
-                                                shared_state=None,
-                                                is_shared=False,
-                                            )
+                                            for start_w in range(0, len(prompts), args.batch_size):
+                                                warmup_batch = prompts[start_w : start_w + args.batch_size]
+                                                tmp = _generate_images(
+                                                    warmup_batch,
+                                                    text_model,
+                                                    text_tokenizer,
+                                                    infer_func,
+                                                    args.use_llm_system_prompt,
+                                                    args.max_token_length,
+                                                    args.cfg,
+                                                    seed,
+                                                    args.more_smooth,
+                                                    alpha_stage,
+                                                    shared_state=None,
+                                                    is_shared=False,
+                                                )
                                 for start in range(0, len(prompts), args.batch_size):
                                     batch_prompts = prompts[start : start + args.batch_size]
                                     imgs = _generate_images(
@@ -458,20 +462,22 @@ def main(args):
                             sample_start = now()
                             if args.warmup_iterations > 0 and not args.generate_grids:
                                 for _ in range(args.warmup_iterations):
-                                    _ = _generate_images(
-                                        baseline_prompts,
-                                        text_model,
-                                        text_tokenizer,
-                                        infer_func,
-                                        args.use_llm_system_prompt,
-                                        args.max_token_length,
-                                        args.cfg,
-                                        seed,
-                                        args.more_smooth,
-                                        alpha_stage,
-                                        shared_state=None,
-                                        is_shared=False,
-                                    )
+                                    for start_w in range(0, len(baseline_prompts), args.batch_size):
+                                        warmup_batch = baseline_prompts[start_w : start_w + args.batch_size]
+                                        tmp = _generate_images(
+                                            warmup_batch,
+                                            text_model,
+                                            text_tokenizer,
+                                            infer_func,
+                                            args.use_llm_system_prompt,
+                                            args.max_token_length,
+                                            args.cfg,
+                                            seed,
+                                            args.more_smooth,
+                                            alpha_stage,
+                                            shared_state=None,
+                                            is_shared=False,
+                                        )
                         for start in range(0, len(baseline_prompts), args.batch_size):
                             batch_prompts = baseline_prompts[start : start + args.batch_size]
                             imgs = _generate_images(
@@ -667,7 +673,7 @@ if __name__ == "__main__":
         "--resize_individual_to",
         type=int,
         help="Resize saved individual images to this square resolution (omit to keep original).",
-        default=None,
+        default=256,
     )
 
     # ***********************************************************
@@ -682,7 +688,7 @@ if __name__ == "__main__":
         "--warmup_iterations",
         type=int,
         help="GPU warmup iterations before timing (only when --enable_timing).",
-        default=0,
+        default=50,
     )
     args = parser.parse_args()
 

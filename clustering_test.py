@@ -31,7 +31,7 @@ from transformers import (
     HfArgumentParser,
     set_seed,
 )
-
+from hart.modules.models.transformer import HARTForT2I
 from hart.utils.constants import (
     summarization_prompt_template,
     enrichment_prompt_template,
