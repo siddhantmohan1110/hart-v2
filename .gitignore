@@ -170,3 +170,5 @@ __pycache__/
 
 exp*/
 .vscode/
+
+*.sbatch
