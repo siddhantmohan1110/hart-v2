@@ -45,7 +45,7 @@ def save_images(sample_imgs, sample_folder_dir, store_separately, prompts):
             cur_img = sample_imgs_np[img_idx]
             cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
             cur_img_store = Image.fromarray(cur_img)
-            cur_img_store.save(os.path.join(sample_folder_dir, f"{time.strftime("%Y%m%d_%H%M%S")}_{img_idx:06d}.png"))
+            cur_img_store.save(os.path.join(sample_folder_dir, f"{img_idx:05d}_{time.strftime("%Y%m%d_%H%M%S")}.png"))
             print(f"Image {img_idx} saved.")
 
     with open(os.path.join(sample_folder_dir, "prompt.txt"), "w") as f:
@@ -99,11 +99,15 @@ def main(args):
 
     # Load shared state (fhat_centroids) for id:9 clustering
     shared_state_cache = None
-    if os.path.exists(SHARED_STATE_PATH):
-        shared_state_cache = torch.load(SHARED_STATE_PATH, map_location="cpu")
-        print(f"Loaded shared state from {SHARED_STATE_PATH}")
+    shared_state_path = args.shared_state_path
+    if shared_state_path:
+        if os.path.exists(shared_state_path):
+            shared_state_cache = torch.load(shared_state_path, map_location="cpu")
+            print(f"Loaded shared state from {shared_state_path}")
+        else:
+            print(f"Warning: Shared state not found at {shared_state_path}")
     else:
-        print(f"Warning: Shared state not found at {SHARED_STATE_PATH}")
+        print("No shared state path provided. Proceeding without shared state.")
 
     alpha_stage = 3  # Use stage 3 for id:9 clustering
 
@@ -199,6 +203,12 @@ if __name__ == "__main__":
         "--store_seperately",
         help="Store image samples in a grid or separately, set to False by default.",
         action="store_true",
+    )
+    parser.add_argument(
+        "--shared_state_path",
+        type=str,
+        default=SHARED_STATE_PATH,
+        help="Optional path to shared state cache (fhat). Leave empty to disable shared state.",
     )
     args = parser.parse_args()
 

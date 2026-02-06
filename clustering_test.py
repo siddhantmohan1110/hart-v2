@@ -397,6 +397,7 @@ def main(
     ordered_ids = sorted(summary_centroids.keys(), key=_cluster_sort_key)
     ordered_summary_centroids = {cid: summary_centroids[cid] for cid in ordered_ids}
     ordered_cluster_prompts = {cid: cluster_prompts[cid] for cid in ordered_ids}
+    prompt_centroid_map = {x: cid for cid in ordered_ids for x in cluster_prompts[cid]}
 
     # Save summary centroids to file
     with open("summary_centroids.json", "w") as f:
@@ -404,6 +405,11 @@ def main(
     # Save prompts grouped by cluster_id to file
     with open("cluster_prompts.json", "w") as f:
         json.dump(ordered_cluster_prompts, f, indent=2)
+
+    with open("prompt_centroid_map.json", "w") as f:
+        json.dump(prompt_centroid_map, f, indent=2)
+
+
 
     print(f"\nSaved summaries for {len(summary_centroids)} clusters to summary_centroids.json")
 
